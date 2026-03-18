@@ -1,0 +1,687 @@
+#include "downloader.h"
+#include "tracker.h"
+#include "tracker_list.h"
+#include "utils.h"
+#include <thread>
+#include <chrono>
+#include <iostream>
+#include <algorithm>
+#include <queue>
+#include <random>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <map>
+#include <set>
+#include <sstream>
+
+Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath)
+    : torrent_(torrent), savePath_(savePath), peerId_(torrent.peerId),
+      lastSpeedUpdateTime_(std::chrono::steady_clock::now()) {
+
+    piecesCompleted_.resize(torrent.numPieces(), false);
+    pieceStates_.reserve(torrent.numPieces());
+    for (uint32_t i = 0; i < torrent.numPieces(); i++) {
+        pieceStates_.emplace_back(calculateBlocksForPiece(i));
+    }
+}
+
+Downloader::~Downloader() {
+    stop();
+    if (outputFile_) {
+        fclose(outputFile_);
+    }
+}
+
+void Downloader::start() {
+    if (running_) return;
+    
+    running_ = true;
+    stopRequested_ = false;
+    
+    // Open output file
+    std::string outputPath = savePath_ + "/" + torrent_.name;
+    outputFile_ = fopen(outputPath.c_str(), "wb");
+    if (!outputFile_) {
+        std::cerr << "Failed to create output file: " << outputPath << std::endl;
+        running_ = false;
+        return;
+    }
+    
+    // Pre-allocate file
+    int64_t totalSize = torrent_.totalLength();
+    fseeko(outputFile_, totalSize - 1, SEEK_SET);
+    fputc(0, outputFile_);
+    fflush(outputFile_);
+    fseeko(outputFile_, 0, SEEK_SET);
+    
+    // Start download loop in separate thread
+    std::thread(&Downloader::downloadLoop, this).detach();
+}
+
+void Downloader::stop() {
+    stopRequested_ = true;
+    running_ = false;
+    
+    // Disconnect all peers
+    for (auto& peer : peers_) {
+        if (peer) {
+            peer->disconnect();
+        }
+    }
+    peers_.clear();
+}
+
+void Downloader::downloadLoop() {
+    auto lastTime = std::chrono::steady_clock::now();
+    auto lastTrackerFetch = std::chrono::steady_clock::now();
+    const int TRACKER_FETCH_INTERVAL = 300;  // Fetch new trackers every 5 minutes
+
+    // Fetch latest trackers from online sources
+    fetchLatestTrackers();
+
+    // Contact tracker initially
+    std::cout << "Contacting tracker..." << std::endl;
+    
+    // Try first tracker, if fails try others
+    TrackerResponse trackerResp;
+    std::string trackerUrl;
+    
+    for (const auto& url : torrent_.announceList) {
+        trackerUrl = url;
+        trackerResp = contactTracker(
+            trackerUrl,
+            torrent_,
+            peerId_,
+            downloadedBytes_,
+            uploadedBytes_,
+            torrent_.totalLength() - downloadedBytes_,
+            "started"
+        );
+        
+        if (trackerResp.ok()) {
+            std::cout << "Connected to tracker: " << trackerUrl << std::endl;
+            break;
+        }
+    }
+
+    if (trackerResp.ok()) {
+        std::cout << "Tracker response: " << trackerResp.peers.size() << " peers, "
+                  << trackerResp.complete << " seeders, " << trackerResp.incomplete << " leechers" << std::endl;
+        addPeers(trackerResp.peers);
+    } else {
+        std::cerr << "Tracker error: " << trackerResp.failure << std::endl;
+    }
+
+    int idleCounter = 0;
+    const int MAX_IDLE_CYCLES = 60;  // Increased to allow more time for peer response
+    int trackerRetryCounter = 0;
+    const int TRACKER_RETRY_INTERVAL = 30;  // Retry tracker every 30 seconds on failure
+
+    while (running_ && !stopRequested_) {
+        // Connect to peers
+        connectToPeers();
+
+        // Process incoming messages from all peers (non-blocking)
+        processPeerMessages();
+
+        // Request blocks from peers that are not choking
+        requestPieces();
+
+        // Clean up timed-out requests
+        cleanupTimedOutRequests();
+
+        // Update speed stats
+        updateSpeedStats();
+
+        // Check if complete
+        if (isComplete()) {
+            std::cout << "Download complete!" << std::endl;
+            break;
+        }
+
+        // Re-contact tracker if needed or if we have too few peers
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count();
+        auto elapsedSinceFetch = std::chrono::duration_cast<std::chrono::seconds>(now - lastTrackerFetch).count();
+
+        int activePeerCount = 0;
+        for (const auto& peer : peers_) {
+            if (peer && peer->isConnected()) activePeerCount++;
+        }
+
+        // Fetch new trackers periodically
+        if (elapsedSinceFetch >= TRACKER_FETCH_INTERVAL) {
+            std::cout << "Refreshing tracker list..." << std::endl;
+            fetchLatestTrackers();
+            lastTrackerFetch = now;
+        }
+
+        // Re-contact tracker if interval elapsed or we need more peers
+        bool needMorePeers = activePeerCount < 10;
+        if ((trackerResp.ok() && elapsed >= trackerResp.interval) ||
+            (needMorePeers && elapsed >= TRACKER_RETRY_INTERVAL)) {
+            // Try each tracker in the list until one succeeds
+            bool trackerSuccess = false;
+            for (const auto& url : torrent_.announceList) {
+                trackerResp = contactTracker(
+                    url,
+                    torrent_,
+                    peerId_,
+                    downloadedBytes_,
+                    uploadedBytes_,
+                    torrent_.totalLength() - downloadedBytes_
+                );
+                if (trackerResp.ok()) {
+                    std::cout << "Tracker update: " << trackerResp.peers.size() << " new peers" << std::endl;
+                    addPeers(trackerResp.peers);
+                    trackerRetryCounter = 0;
+                    trackerSuccess = true;
+                    break;
+                }
+            }
+            if (!trackerSuccess) {
+                trackerRetryCounter++;
+                std::cerr << "All trackers failed, retrying later..." << std::endl;
+            }
+            lastTime = now;
+            idleCounter = 0;
+        }
+
+        // Check for idle state (no progress)
+        if (downloadedBytes_ == lastDownloadedBytes_) {
+            idleCounter++;
+            if (idleCounter > MAX_IDLE_CYCLES) {
+                // Try to get more peers
+                std::cout << "Download idle, requesting more peers..." << std::endl;
+                // Try all trackers
+                for (const auto& url : torrent_.announceList) {
+                    trackerResp = contactTracker(
+                        url,
+                        torrent_,
+                        peerId_,
+                        downloadedBytes_,
+                        uploadedBytes_,
+                        torrent_.totalLength() - downloadedBytes_
+                    );
+                    if (trackerResp.ok()) {
+                        addPeers(trackerResp.peers);
+                        break;
+                    }
+                }
+                idleCounter = 0;
+            }
+        } else {
+            idleCounter = 0;
+        }
+        lastDownloadedBytes_ = downloadedBytes_;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // Increased from 20ms to reduce CPU usage
+    }
+
+    // Send stopped event to tracker
+    if (!torrent_.announceList.empty()) {
+        for (const auto& url : torrent_.announceList) {
+            contactTracker(
+                url,
+                torrent_,
+                peerId_,
+                downloadedBytes_,
+                uploadedBytes_,
+                torrent_.totalLength() - downloadedBytes_,
+                "stopped"
+            );
+        }
+    }
+}
+
+bool Downloader::connectToPeers() {
+    // Limit concurrent connections - reduced for better stability
+    const int maxPeers = 30;  // Reduced max peers to avoid connection overload
+    const int minPeers = 5;   // Reduced minimum active connections
+
+    int connectedCount = 0;
+    for (const auto& peer : peers_) {
+        if (peer && peer->isConnected()) {
+            connectedCount++;
+        }
+    }
+
+    // Sort peers by speed score (prefer faster peers)
+    std::sort(peers_.begin(), peers_.end(),
+        [this](const std::unique_ptr<PeerConnection>& a, const std::unique_ptr<PeerConnection>& b) {
+            auto itA = peerSpeedStats_.find(a.get());
+            auto itB = peerSpeedStats_.find(b.get());
+            double speedA = (itA != peerSpeedStats_.end()) ? itA->second.avgSpeed : 0.0;
+            double speedB = (itB != peerSpeedStats_.end()) ? itB->second.avgSpeed : 0.0;
+            return speedA > speedB;  // Faster peers first
+        });
+
+    // Connect to more peers if we have fewer than minimum
+    for (const auto& peer : peers_) {
+        if (!peer || peer->isConnected()) continue;
+        if (connectedCount >= maxPeers) break;
+
+        if (peer->connect()) {
+            connectedCount++;
+            // Send optimistic unchoke to new peer (BEP 3)
+            // This tells the peer we're willing to send data (if we had any)
+            peer->sendUnchoke();
+        }
+    }
+    return connectedCount >= minPeers;
+}
+
+void Downloader::requestPieces() {
+    // Count requests per peer
+    std::map<PeerConnection*, int> requestsPerPeer;
+    for (const auto& req : pendingRequests_) {
+        requestsPerPeer[req.peer]++;
+    }
+
+    // Sort peers by speed (prefer faster peers)
+    std::vector<PeerConnection*> sortedPeers;
+    for (auto& peerPtr : peers_) {
+        if (peerPtr && peerPtr->isConnected() && !peerPtr->peerChoking()) {
+            sortedPeers.push_back(peerPtr.get());
+        }
+    }
+    std::sort(sortedPeers.begin(), sortedPeers.end(),
+        [this, &requestsPerPeer](PeerConnection* a, PeerConnection* b) {
+            auto itA = peerSpeedStats_.find(a);
+            auto itB = peerSpeedStats_.find(b);
+            double speedA = (itA != peerSpeedStats_.end()) ? itA->second.avgSpeed : 0.0;
+            double speedB = (itB != peerSpeedStats_.end()) ? itB->second.avgSpeed : 0.0;
+            // Prefer peers with fewer pending requests if speeds are similar
+            int reqA = requestsPerPeer[a];
+            int reqB = requestsPerPeer[b];
+            if (std::abs(speedA - speedB) < 1024.0) {  // Within 1KB/s
+                return reqA < reqB;
+            }
+            return speedA > speedB;
+        });
+
+    for (auto* peer : sortedPeers) {
+        // Skip if this peer already has too many pending requests
+        if (requestsPerPeer[peer] >= MAX_REQUESTS_PER_PEER) continue;
+        requestBlocksFromPeer(peer);
+    }
+}
+
+void Downloader::requestBlocksFromPeer(PeerConnection* peer) {
+    if (!peer || !peer->isConnected() || peer->peerChoking()) return;
+
+    const uint32_t blockSize = 16384;  // 16 KB
+
+    // Count current requests for this peer
+    int currentRequests = 0;
+    for (const auto& req : pendingRequests_) {
+        if (req.peer == peer) currentRequests++;
+    }
+
+    if (currentRequests >= MAX_REQUESTS_PER_PEER) return;
+
+    // Find pieces this peer has that we need
+    std::vector<uint32_t> neededPieces;
+    for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+        if (piecesCompleted_[i]) continue;
+        if (!peer->hasPiece(i)) continue;
+
+        // Check if we're already downloading all blocks of this piece
+        if (pieceStates_[i].receivedBlocks < pieceStates_[i].totalBlocks) {
+            neededPieces.push_back(i);
+        }
+    }
+
+    if (neededPieces.empty()) return;
+
+    // Select the best piece using rarest-first with partial completion priority
+    uint32_t selectedPiece = selectNextPiece();
+    if (selectedPiece == UINT32_MAX || !peer->hasPiece(selectedPiece)) {
+        // Fallback to any available piece from this peer
+        for (uint32_t p : neededPieces) {
+            if (peer->hasPiece(p)) {
+                selectedPiece = p;
+                break;
+            }
+        }
+    }
+
+    if (selectedPiece == UINT32_MAX) return;
+
+    // Request missing blocks for this piece
+    PieceState& state = pieceStates_[selectedPiece];
+    int64_t pieceStart = static_cast<int64_t>(selectedPiece) * torrent_.pieceLength;
+    int64_t pieceEnd = std::min(pieceStart + torrent_.pieceLength, torrent_.totalLength());
+    int64_t pieceSize = pieceEnd - pieceStart;
+
+    for (int i = 0; i < state.totalBlocks && currentRequests < MAX_REQUESTS_PER_PEER; i++) {
+        if (state.blocksRequested[i] || state.blocksReceived[i]) continue;
+
+        uint32_t offset = i * blockSize;
+        uint32_t blockLen = std::min(static_cast<int64_t>(blockSize), pieceSize - offset);
+
+        if (peer->sendRequest(selectedPiece, offset, blockLen)) {
+            state.blocksRequested[i] = true;
+
+            BlockRequest req;
+            req.pieceIndex = selectedPiece;
+            req.offset = offset;
+            req.length = blockLen;
+            req.peer = peer;
+            req.requestTime = std::chrono::steady_clock::now();
+            pendingRequests_.push_back(req);
+
+            currentRequests++;
+        } else {
+            break;  // Peer can't handle more requests
+        }
+    }
+}
+
+uint32_t Downloader::selectNextPiece() {
+    // Rarest-first strategy with partial completion priority
+    // 1. First, prefer pieces that are partially downloaded (to avoid wasting bandwidth)
+    // 2. Among those, select the one with highest completion percentage
+    // 3. If no partial pieces, use rarest-first based on peer availability
+
+    uint32_t bestPiece = UINT32_MAX;
+    int bestScore = -1;
+
+    // Count how many peers have each piece
+    std::vector<int> peerCount(torrent_.numPieces(), 0);
+    for (const auto& peerPtr : peers_) {
+        if (!peerPtr || !peerPtr->isConnected()) continue;
+        for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+            if (!piecesCompleted_[i] && peerPtr->hasPiece(i)) {
+                peerCount[i]++;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+        if (piecesCompleted_[i]) continue;
+
+        const PieceState& state = pieceStates_[i];
+        
+        // Skip pieces with no progress unless no partial pieces exist
+        if (state.receivedBlocks == 0) continue;
+
+        // Score based on:
+        // 1. Completion percentage (higher = better, to finish pieces quickly)
+        // 2. Rarity (fewer peers = higher priority)
+        int completionPct = state.receivedBlocks * 1000 / state.totalBlocks;
+        int rarityScore = (peerCount[i] > 0) ? (1000 / peerCount[i]) : 10000;
+        
+        // Combined score: completion is primary, rarity is secondary
+        int score = completionPct * 100 + rarityScore;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestPiece = i;
+        }
+    }
+
+    // If no partial pieces, select based on rarest-first
+    if (bestPiece == UINT32_MAX) {
+        int minPeers = INT32_MAX;
+        for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+            if (piecesCompleted_[i]) continue;
+            if (peerCount[i] < minPeers) {
+                minPeers = peerCount[i];
+                bestPiece = i;
+            }
+        }
+    }
+
+    return bestPiece;
+}
+
+void Downloader::processPeerMessages() {
+    const uint32_t blockSize = 16384;
+
+    for (auto& peerPtr : peers_) {
+        if (!peerPtr || !peerPtr->isConnected()) continue;
+
+        PeerConnection* peer = peerPtr.get();
+
+        // Try to receive and process messages (non-blocking)
+        PeerMessage msg;
+        while (peer->receiveMessageNonBlocking(msg)) {
+            switch (msg.id) {
+                case MessageId::Choke:
+                    // Peer is choking, cancel pending requests to this peer
+                    cancelRequestsForPeer(peer);
+                    // Mark peer as slow on choke
+                    peerSpeedStats_[peer].failedRequests++;
+                    break;
+
+                case MessageId::Unchoke:
+                    // Peer is unchoking, can request more blocks
+                    // Reset peer speed stats on unchoke
+                    peerSpeedStats_[peer].lastUpdateTime = std::chrono::steady_clock::now();
+                    peerSpeedStats_[peer].bytesDownloaded = 0;
+                    break;
+
+                case MessageId::Have:
+                    if (msg.payload.size() >= 4) {
+                        // uint32_t pieceIndex = utils::bytesToInt(msg.payload.data());
+                        // Update peer's bitfield (handled in peer.cpp)
+                    }
+                    break;
+
+                case MessageId::KeepAlive:
+                    // Keep-alive message received, connection is still active
+                    // No action needed, just acknowledge
+                    break;
+
+                case MessageId::Bitfield:
+                    // Bitfield already handled in peer.cpp
+                    // Peer's bitfield is updated, we can now request pieces
+                    break;
+
+                case MessageId::Block: {
+                    // Parse block response
+                    if (msg.payload.size() < 8) break;
+
+                    uint32_t pieceIndex = utils::bytesToInt(msg.payload.data());
+                    uint32_t offset = utils::bytesToInt(msg.payload.data() + 4);
+
+                    // Find matching request
+                    auto it = std::find_if(pendingRequests_.begin(), pendingRequests_.end(),
+                        [pieceIndex, offset, peer](const BlockRequest& req) {
+                            return req.pieceIndex == pieceIndex &&
+                                   req.offset == offset &&
+                                   req.peer == peer;
+                        });
+
+                    if (it != pendingRequests_.end()) {
+                        // Extract block data
+                        std::vector<uint8_t> blockData(msg.payload.begin() + 8, msg.payload.end());
+
+                        // Write piece
+                        writePiece(pieceIndex, offset, blockData);
+                        downloadedBytes_ += blockData.size();
+
+                        // Update peer speed stats
+                        peerSpeedStats_[peer].updateSpeed(blockData.size());
+
+                        // Mark block as received
+                        PieceState& state = pieceStates_[pieceIndex];
+                        int blockIndex = offset / blockSize;
+                        if (blockIndex < state.totalBlocks && !state.blocksReceived[blockIndex]) {
+                            state.blocksReceived[blockIndex] = true;
+                            state.receivedBlocks++;
+
+                            // Check if piece is complete
+                            if (state.receivedBlocks >= state.totalBlocks) {
+                                piecesCompleted_[pieceIndex] = true;
+                                piecesCompletedCount_++;
+                                std::cout << "Piece " << pieceIndex << " complete ("
+                                          << piecesCompletedCount_ << "/" << torrent_.numPieces() << ")" << std::endl;
+                            }
+                        }
+
+                        pendingRequests_.erase(it);
+                    }
+                    break;
+                }
+
+                default:
+                    break;
+            }
+        }
+    }
+}
+
+void Downloader::cleanupTimedOutRequests() {
+    auto now = std::chrono::steady_clock::now();
+
+    auto it = pendingRequests_.begin();
+    while (it != pendingRequests_.end()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - it->requestTime).count();
+
+        if (elapsed > REQUEST_TIMEOUT_MS) {
+            // Reset block request flag
+            PieceState& state = pieceStates_[it->pieceIndex];
+            int blockIndex = it->offset / 16384;
+            if (blockIndex < state.totalBlocks) {
+                state.blocksRequested[blockIndex] = false;
+            }
+
+            // Mark peer request as failed
+            peerSpeedStats_[it->peer].failedRequests++;
+
+            it = pendingRequests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Downloader::cancelRequestsForPeer(PeerConnection* peer) {
+    for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ) {
+        if (it->peer == peer) {
+            // Reset block request flag
+            PieceState& state = pieceStates_[it->pieceIndex];
+            int blockIndex = it->offset / 16384;
+            if (blockIndex < state.totalBlocks) {
+                state.blocksRequested[blockIndex] = false;
+            }
+            it = pendingRequests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Downloader::updateSpeedStats() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - lastSpeedUpdateTime_).count();
+    
+    if (elapsed >= 1) {
+        int64_t delta = downloadedBytes_ - lastDownloadedBytes_;
+        currentSpeed_ = static_cast<double>(delta) / elapsed;
+        lastSpeedUpdateTime_ = now;
+        lastDownloadedBytes_ = downloadedBytes_;
+    }
+}
+
+int Downloader::calculateBlocksForPiece(uint32_t pieceIndex) const {
+    const uint32_t blockSize = 16384;  // 16 KB
+    int64_t pieceStart = static_cast<int64_t>(pieceIndex) * torrent_.pieceLength;
+    int64_t pieceEnd = std::min(pieceStart + torrent_.pieceLength, torrent_.totalLength());
+    int64_t pieceSize = pieceEnd - pieceStart;
+    return (pieceSize + blockSize - 1) / blockSize;
+}
+
+void Downloader::writePiece(uint32_t index, uint32_t offset, const std::vector<uint8_t>& data) {
+    if (!outputFile_) return;
+    
+    int64_t fileOffset = static_cast<int64_t>(index) * torrent_.pieceLength + offset;
+    
+    fseeko(outputFile_, fileOffset, SEEK_SET);
+    fwrite(data.data(), 1, data.size(), outputFile_);
+}
+
+bool Downloader::hasPiece(uint32_t index) const {
+    return index < piecesCompleted_.size() && piecesCompleted_[index];
+}
+
+bool Downloader::isComplete() const {
+    return piecesCompletedCount_ >= torrent_.numPieces();
+}
+
+double Downloader::getProgress() const {
+    if (torrent_.numPieces() == 0) return 0.0;
+    return static_cast<double>(piecesCompletedCount_) / torrent_.numPieces();
+}
+
+DownloadStats Downloader::getStats() const {
+    DownloadStats stats;
+    stats.downloaded = downloadedBytes_;
+    stats.uploaded = uploadedBytes_;
+    stats.totalLength = torrent_.totalLength();
+    stats.downloadSpeed = currentSpeed_;
+    stats.currentSpeed = currentSpeed_;
+    stats.progress = getProgress();
+    stats.connectedPeers = static_cast<int>(peers_.size());
+    stats.activePeers = 0;
+
+    for (const auto& peer : peers_) {
+        if (peer && peer->isConnected()) {
+            stats.activePeers++;
+        }
+    }
+
+    return stats;
+}
+
+void Downloader::addPeers(const std::vector<Peer>& peers) {
+    for (const auto& peer : peers) {
+        // Check if already connected
+        bool exists = false;
+        for (const auto& existing : peers_) {
+            if (existing && existing->ip() == peer.ip && existing->port() == peer.port) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists) {
+            peers_.push_back(std::make_unique<PeerConnection>(
+                peer.ip, peer.port, torrent_, peerId_
+            ));
+        }
+    }
+}
+
+void Downloader::fetchLatestTrackers() {
+    std::cout << "Fetching latest tracker list from online sources..." << std::endl;
+    
+    std::vector<std::string> newTrackers = TrackerList::fetchTrackersFromMultipleSources({
+        TrackerList::Source::TRACKERSLIST_ALL,
+        TrackerList::Source::NGOSANG_ALL
+    });
+    
+    if (newTrackers.empty()) {
+        std::cerr << "Warning: Failed to fetch online tracker list" << std::endl;
+        return;
+    }
+    
+    std::cout << "Fetched " << newTrackers.size() << " trackers" << std::endl;
+    
+    // Merge with existing announce list, avoiding duplicates
+    std::set<std::string> existingTrackers(torrent_.announceList.begin(), torrent_.announceList.end());
+    
+    for (const auto& tracker : newTrackers) {
+        if (existingTrackers.find(tracker) == existingTrackers.end()) {
+            torrent_.announceList.push_back(tracker);
+            existingTrackers.insert(tracker);
+        }
+    }
+    
+    std::cout << "Total trackers available: " << torrent_.announceList.size() << std::endl;
+}
