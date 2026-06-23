@@ -8,6 +8,41 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
+
+namespace {
+constexpr uint32_t MAX_PEER_MESSAGE_SIZE = 4 * 1024 * 1024;
+
+bool sendAll(int socket, const uint8_t* data, size_t size) {
+    size_t totalSent = 0;
+    while (totalSent < size) {
+        ssize_t sent = send(socket, data + totalSent, size - totalSent, 0);
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent <= 0) {
+            return false;
+        }
+        totalSent += static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+bool recvAll(int socket, uint8_t* data, size_t size, int flags) {
+    size_t totalReceived = 0;
+    while (totalReceived < size) {
+        ssize_t received = recv(socket, data + totalReceived, size - totalReceived, flags);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return false;
+        }
+        totalReceived += static_cast<size_t>(received);
+    }
+    return true;
+}
+}
 
 PeerMessage PeerMessage::createKeepAlive() {
     PeerMessage msg;
@@ -187,27 +222,20 @@ bool PeerConnection::performHandshake() {
     memcpy(&handshake[48], peerId_.c_str(), 20);
     
     // Send handshake
-    ssize_t sent = send(socket_, handshake.data(), handshake.size(), 0);
-    if (sent != 68) {
+    if (!sendAll(socket_, handshake.data(), handshake.size())) {
         return false;
     }
 
     // Receive handshake with timeout
     std::vector<uint8_t> recvHandshake(68);
-    size_t receivedTotal = 0;
-    
     // Set receive timeout
     struct timeval tv;
     tv.tv_sec = 10;
     tv.tv_usec = 0;
     setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    while (receivedTotal < 68) {
-        ssize_t received = recv(socket_, recvHandshake.data() + receivedTotal, 68 - receivedTotal, 0);
-        if (received <= 0) {
-            return false;
-        }
-        receivedTotal += received;
+
+    if (!recvAll(socket_, recvHandshake.data(), recvHandshake.size(), 0)) {
+        return false;
     }
     
     // Reset to blocking mode
@@ -256,8 +284,7 @@ bool PeerConnection::sendMessage(const PeerMessage& msg) {
         buffer.insert(buffer.end(), msg.payload.begin(), msg.payload.end());
     }
     
-    ssize_t sent = send(socket_, buffer.data(), buffer.size(), 0);
-    return sent == static_cast<ssize_t>(buffer.size());
+    return sendAll(socket_, buffer.data(), buffer.size());
 }
 
 bool PeerConnection::sendChoke() {
@@ -292,8 +319,7 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
 
     // Read length (4 bytes)
     uint8_t lengthBuf[4];
-    ssize_t received = recv(socket_, lengthBuf, 4, 0);
-    if (received != 4) {
+    if (!recvAll(socket_, lengthBuf, 4, MSG_WAITALL)) {
         return false;
     }
 
@@ -301,6 +327,10 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
                  (static_cast<uint32_t>(lengthBuf[1]) << 16) |
                  (static_cast<uint32_t>(lengthBuf[2]) << 8) |
                  static_cast<uint32_t>(lengthBuf[3]);
+
+    if (msg.length > MAX_PEER_MESSAGE_SIZE) {
+        return false;
+    }
 
     // Keep-alive message (length = 0)
     if (msg.length == 0) {
@@ -310,8 +340,7 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
 
     // Read message ID
     uint8_t idBuf[1];
-    received = recv(socket_, idBuf, 1, 0);
-    if (received != 1) {
+    if (!recvAll(socket_, idBuf, 1, MSG_WAITALL)) {
         return false;
     }
     msg.id = static_cast<MessageId>(idBuf[0]);
@@ -319,8 +348,7 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
     // Read payload
     if (msg.length > 1) {
         msg.payload.resize(msg.length - 1);
-        received = recv(socket_, msg.payload.data(), msg.payload.size(), 0);
-        if (received != static_cast<ssize_t>(msg.payload.size())) {
+        if (!recvAll(socket_, msg.payload.data(), msg.payload.size(), MSG_WAITALL)) {
             return false;
         }
     }
@@ -374,10 +402,14 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
         return false;  // No data available
     }
 
-    // Read length (4 bytes)
+    int available = 0;
+    if (ioctl(socket_, FIONREAD, &available) != 0 || available < 4) {
+        return false;
+    }
+
+    // Peek length (4 bytes) so partial messages stay in the socket buffer.
     uint8_t lengthBuf[4];
-    ssize_t received = recv(socket_, lengthBuf, 4, MSG_DONTWAIT);
-    if (received != 4) {
+    if (recv(socket_, lengthBuf, 4, MSG_PEEK | MSG_DONTWAIT) != 4) {
         return false;
     }
 
@@ -385,6 +417,15 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
                  (static_cast<uint32_t>(lengthBuf[1]) << 16) |
                  (static_cast<uint32_t>(lengthBuf[2]) << 8) |
                  static_cast<uint32_t>(lengthBuf[3]);
+
+    if (msg.length > MAX_PEER_MESSAGE_SIZE ||
+        available < static_cast<int64_t>(4 + msg.length)) {
+        return false;
+    }
+
+    if (!recvAll(socket_, lengthBuf, 4, MSG_DONTWAIT)) {
+        return false;
+    }
 
     // Keep-alive message (length = 0)
     if (msg.length == 0) {
@@ -394,8 +435,7 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
 
     // Read message ID
     uint8_t idBuf[1];
-    received = recv(socket_, idBuf, 1, MSG_DONTWAIT);
-    if (received != 1) {
+    if (!recvAll(socket_, idBuf, 1, MSG_DONTWAIT)) {
         return false;
     }
     msg.id = static_cast<MessageId>(idBuf[0]);
@@ -403,8 +443,7 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
     // Read payload
     if (msg.length > 1) {
         msg.payload.resize(msg.length - 1);
-        received = recv(socket_, msg.payload.data(), msg.payload.size(), MSG_DONTWAIT);
-        if (received != static_cast<ssize_t>(msg.payload.size())) {
+        if (!recvAll(socket_, msg.payload.data(), msg.payload.size(), MSG_DONTWAIT)) {
             return false;
         }
     }
@@ -454,23 +493,29 @@ bool PeerConnection::readBlock(uint32_t piece, uint32_t offset, uint32_t length,
     while (totalRead < length) {
         // Read message length
         uint8_t lengthBuf[4];
-        ssize_t received = recv(socket_, lengthBuf, 4, MSG_WAITALL);
-        if (received != 4) return false;
+        if (!recvAll(socket_, lengthBuf, 4, MSG_WAITALL)) return false;
         
         uint32_t msgLength = (static_cast<uint32_t>(lengthBuf[0]) << 24) |
                              (static_cast<uint32_t>(lengthBuf[1]) << 16) |
                              (static_cast<uint32_t>(lengthBuf[2]) << 8) |
                              static_cast<uint32_t>(lengthBuf[3]);
+
+        if (msgLength == 0) {
+            continue;
+        }
+
+        if (msgLength > MAX_PEER_MESSAGE_SIZE) {
+            return false;
+        }
         
         // Read message ID
         uint8_t id;
-        received = recv(socket_, &id, 1, MSG_WAITALL);
-        if (received != 1) return false;
+        if (!recvAll(socket_, &id, 1, MSG_WAITALL)) return false;
         
         if (static_cast<MessageId>(id) != MessageId::Block) {
             // Not a block message, skip payload
             std::vector<uint8_t> skip(msgLength - 1);
-            recv(socket_, skip.data(), skip.size(), MSG_WAITALL);
+            if (!recvAll(socket_, skip.data(), skip.size(), MSG_WAITALL)) return false;
             continue;
         }
 
@@ -480,20 +525,18 @@ bool PeerConnection::readBlock(uint32_t piece, uint32_t offset, uint32_t length,
         
         // Read piece index (4 bytes)
         uint8_t pieceBuf[4];
-        received = recv(socket_, pieceBuf, 4, MSG_WAITALL);
-        if (received != 4) return false;
+        if (!recvAll(socket_, pieceBuf, 4, MSG_WAITALL)) return false;
         uint32_t responsePiece = utils::bytesToInt(pieceBuf);
         
         // Read offset (4 bytes)
         uint8_t offsetBuf[4];
-        received = recv(socket_, offsetBuf, 4, MSG_WAITALL);
-        if (received != 4) return false;
+        if (!recvAll(socket_, offsetBuf, 4, MSG_WAITALL)) return false;
         uint32_t responseOffset = utils::bytesToInt(offsetBuf);
 
         if (responsePiece != piece || responseOffset != offset + totalRead) {
             uint32_t blockLength = msgLength - 9;
             std::vector<uint8_t> skip(blockLength);
-            recv(socket_, skip.data(), skip.size(), MSG_WAITALL);
+            if (!recvAll(socket_, skip.data(), skip.size(), MSG_WAITALL)) return false;
             return false;
         }
         
@@ -502,15 +545,14 @@ bool PeerConnection::readBlock(uint32_t piece, uint32_t offset, uint32_t length,
         size_t remaining = length - totalRead;
         size_t toRead = std::min(blockLength, static_cast<uint32_t>(remaining));
         
-        received = recv(socket_, data.data() + totalRead, toRead, MSG_WAITALL);
-        if (received != static_cast<ssize_t>(toRead)) return false;
+        if (!recvAll(socket_, data.data() + totalRead, toRead, MSG_WAITALL)) return false;
         
         totalRead += toRead;
         
         if (blockLength > toRead) {
             // Skip remaining data
             std::vector<uint8_t> skip(blockLength - toRead);
-            recv(socket_, skip.data(), skip.size(), MSG_WAITALL);
+            if (!recvAll(socket_, skip.data(), skip.size(), MSG_WAITALL)) return false;
         }
     }
     

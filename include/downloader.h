@@ -10,6 +10,7 @@
 #include <mutex>
 #include <chrono>
 #include <cstddef>
+#include <thread>
 
 struct DownloadStats {
     int64_t downloaded;
@@ -99,6 +100,7 @@ private:
 
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};
+    std::thread downloadThread_;
 
     int64_t downloadedBytes_ = 0;
     int64_t uploadedBytes_ = 0;

@@ -2,6 +2,7 @@
 #include "utils.h"
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 
 // Test SHA1 hashing
 TEST(UtilsTest, SHA1Empty) {
@@ -198,4 +199,37 @@ TEST(UtilsTest, CreateDirectory) {
     EXPECT_TRUE(result);
     
     std::filesystem::remove_all(testDir);
+}
+
+TEST(UtilsTest, CreateDirectoryFailsForExistingFile) {
+    const auto testFile = std::filesystem::temp_directory_path() / "gush_test_file";
+    std::filesystem::remove(testFile);
+
+    {
+        std::ofstream file(testFile);
+        ASSERT_TRUE(file.good());
+    }
+
+    EXPECT_FALSE(utils::createDirectory(testFile.string()));
+
+    std::filesystem::remove(testFile);
+}
+
+TEST(UtilsTest, PathFunctionsAcceptNonNullTerminatedStringView) {
+    const auto testFile = std::filesystem::temp_directory_path() / "gush_test_view_file";
+    std::filesystem::remove(testFile);
+
+    {
+        std::ofstream file(testFile);
+        file << "data";
+        ASSERT_TRUE(file.good());
+    }
+
+    const std::string pathWithSuffix = testFile.string() + "_suffix";
+    const std::string_view pathView(pathWithSuffix.data(), testFile.string().size());
+
+    EXPECT_TRUE(utils::fileExists(pathView));
+    EXPECT_EQ(utils::getFileSize(pathView), 4);
+
+    std::filesystem::remove(testFile);
 }

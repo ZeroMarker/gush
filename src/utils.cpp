@@ -5,6 +5,7 @@
 #include <ctime>
 #include <sys/stat.h>
 #include <cstring>
+#include <cerrno>
 
 namespace utils {
 
@@ -130,20 +131,32 @@ std::string formatTime(int64_t seconds) {
 }
 
 bool createDirectory(std::string_view path) {
-    return mkdir(path.data(), 0755) == 0 || errno == EEXIST;
+    const std::string pathStr(path);
+    if (mkdir(pathStr.c_str(), 0755) == 0) {
+        return true;
+    }
+
+    if (errno != EEXIST) {
+        return false;
+    }
+
+    struct stat st;
+    return stat(pathStr.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 int64_t getFileSize(std::string_view path) {
+    const std::string pathStr(path);
     struct stat st;
-    if (stat(path.data(), &st) != 0) {
+    if (stat(pathStr.c_str(), &st) != 0) {
         return -1;
     }
     return st.st_size;
 }
 
 bool fileExists(std::string_view path) noexcept {
+    const std::string pathStr(path);
     struct stat st;
-    return stat(path.data(), &st) == 0;
+    return stat(pathStr.c_str(), &st) == 0;
 }
 
 } // namespace utils

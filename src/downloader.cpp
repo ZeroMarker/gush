@@ -50,13 +50,21 @@ void Downloader::start() {
     
     // Pre-allocate file
     int64_t totalSize = torrent_.totalLength();
-    fseeko(outputFile_, totalSize - 1, SEEK_SET);
-    fputc(0, outputFile_);
-    fflush(outputFile_);
-    fseeko(outputFile_, 0, SEEK_SET);
+    if (totalSize > 0) {
+        if (fseeko(outputFile_, totalSize - 1, SEEK_SET) != 0 ||
+            fputc(0, outputFile_) == EOF ||
+            fflush(outputFile_) != 0 ||
+            fseeko(outputFile_, 0, SEEK_SET) != 0) {
+            std::cerr << "Failed to pre-allocate output file: " << outputPath << std::endl;
+            fclose(outputFile_);
+            outputFile_ = nullptr;
+            running_ = false;
+            return;
+        }
+    }
     
     // Start download loop in separate thread
-    std::thread(&Downloader::downloadLoop, this).detach();
+    downloadThread_ = std::thread(&Downloader::downloadLoop, this);
 }
 
 void Downloader::stop() {
@@ -69,6 +77,12 @@ void Downloader::stop() {
             peer->disconnect();
         }
     }
+
+    if (downloadThread_.joinable() &&
+        downloadThread_.get_id() != std::this_thread::get_id()) {
+        downloadThread_.join();
+    }
+
     peers_.clear();
 }
 
@@ -233,6 +247,8 @@ void Downloader::downloadLoop() {
             );
         }
     }
+
+    running_ = false;
 }
 
 bool Downloader::connectToPeers() {
