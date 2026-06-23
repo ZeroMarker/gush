@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 
 struct TorrentInfo {
     std::string name;
@@ -29,7 +30,7 @@ struct TorrentInfo {
     
     bool isMultiFile() const { return !files.empty(); }
     int64_t totalLength() const;
-    int numPieces() const;
+    std::size_t numPieces() const;
 };
 
 // Load torrent from file

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "utils.h"
 #include <cstring>
+#include <filesystem>
 
 // Test SHA1 hashing
 TEST(UtilsTest, SHA1Empty) {
@@ -157,41 +158,44 @@ TEST(UtilsTest, FormatTime) {
 
 // Test fileExists
 TEST(UtilsTest, FileExists) {
-    // Test with existing file (CMakeLists.txt should exist)
-    EXPECT_TRUE(utils::fileExists("/root/gush/CMakeLists.txt"));
+    const auto sourceDir = std::filesystem::path(GUSH_SOURCE_DIR);
+    const auto existingFile = sourceDir / "CMakeLists.txt";
+    const auto missingFile = sourceDir / "nonexistent_file_xyz.txt";
+
+    EXPECT_TRUE(utils::fileExists(existingFile.string()));
     
-    // Test with non-existing file
-    EXPECT_FALSE(utils::fileExists("/root/gush/nonexistent_file_xyz.txt"));
+    EXPECT_FALSE(utils::fileExists(missingFile.string()));
 }
 
 // Test getFileSize
 TEST(UtilsTest, GetFileSize) {
-    int64_t size = utils::getFileSize("/root/gush/CMakeLists.txt");
+    const auto sourceDir = std::filesystem::path(GUSH_SOURCE_DIR);
+    const auto existingFile = sourceDir / "CMakeLists.txt";
+    const auto missingFile = sourceDir / "nonexistent_file_xyz.txt";
+
+    int64_t size = utils::getFileSize(existingFile.string());
     EXPECT_GT(size, 0);
     
-    int64_t missingSize = utils::getFileSize("/root/gush/nonexistent_file_xyz.txt");
+    int64_t missingSize = utils::getFileSize(missingFile.string());
     EXPECT_EQ(missingSize, -1);
 }
 
 // Test createDirectory
 TEST(UtilsTest, CreateDirectory) {
-    std::string testDir = "/tmp/gush_test_dir";
+    const auto testDir = std::filesystem::temp_directory_path() / "gush_test_dir";
     
-    // Clean up if exists
-    std::string rmCmd = "rm -rf " + testDir;
-    system(rmCmd.c_str());
+    std::filesystem::remove_all(testDir);
     
     // Create directory
-    bool result = utils::createDirectory(testDir);
+    bool result = utils::createDirectory(testDir.string());
     EXPECT_TRUE(result);
     
     // Verify it exists
-    EXPECT_TRUE(utils::fileExists(testDir));
+    EXPECT_TRUE(utils::fileExists(testDir.string()));
     
     // Create again (should succeed because it already exists)
-    result = utils::createDirectory(testDir);
+    result = utils::createDirectory(testDir.string());
     EXPECT_TRUE(result);
     
-    // Clean up
-    system(rmCmd.c_str());
+    std::filesystem::remove_all(testDir);
 }

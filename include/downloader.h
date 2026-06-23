@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <cstddef>
 
 struct DownloadStats {
     int64_t downloaded;
@@ -94,7 +95,7 @@ private:
     std::vector<std::unique_ptr<PeerConnection>> peers_;
     std::vector<bool> piecesCompleted_;
     std::vector<PieceState> pieceStates_;
-    int piecesCompletedCount_ = 0;
+    std::size_t piecesCompletedCount_ = 0;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};

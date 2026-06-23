@@ -473,16 +473,29 @@ bool PeerConnection::readBlock(uint32_t piece, uint32_t offset, uint32_t length,
             recv(socket_, skip.data(), skip.size(), MSG_WAITALL);
             continue;
         }
+
+        if (msgLength < 9) {
+            return false;
+        }
         
         // Read piece index (4 bytes)
         uint8_t pieceBuf[4];
         received = recv(socket_, pieceBuf, 4, MSG_WAITALL);
         if (received != 4) return false;
+        uint32_t responsePiece = utils::bytesToInt(pieceBuf);
         
         // Read offset (4 bytes)
         uint8_t offsetBuf[4];
         received = recv(socket_, offsetBuf, 4, MSG_WAITALL);
         if (received != 4) return false;
+        uint32_t responseOffset = utils::bytesToInt(offsetBuf);
+
+        if (responsePiece != piece || responseOffset != offset + totalRead) {
+            uint32_t blockLength = msgLength - 9;
+            std::vector<uint8_t> skip(blockLength);
+            recv(socket_, skip.data(), skip.size(), MSG_WAITALL);
+            return false;
+        }
         
         // Read block data
         uint32_t blockLength = msgLength - 9;  // 1 (id) + 4 (piece) + 4 (offset)

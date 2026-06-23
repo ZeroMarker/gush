@@ -39,9 +39,8 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-# Source files
-set(SOURCES
-    src/main.cpp
+# Library source files
+set(GUSH_LIB_SOURCES
     src/bencode.cpp
     src/torrent.cpp
     src/tracker.cpp
@@ -65,19 +64,19 @@ set(HEADERS
     include/tracker_list.h
 )
 
-# Create executable
-add_executable(gush ${SOURCES} ${HEADERS})
-
-# Include directories
-target_include_directories(gush PRIVATE ${CMAKE_SOURCE_DIR}/include)
-
-# Link libraries
-target_link_libraries(gush PRIVATE
+add_library(gush_lib STATIC ${GUSH_LIB_SOURCES} ${HEADERS})
+target_include_directories(gush_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(gush_lib PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     CURL::libcurl
     pthread
 )
+target_compile_options(gush_lib PRIVATE -Wall -Wextra -Wpedantic)
+
+# Create executable
+add_executable(gush src/main.cpp)
+target_link_libraries(gush PRIVATE gush_lib)
 
 # Compiler warnings
 target_compile_options(gush PRIVATE -Wall -Wextra -Wpedantic)
@@ -86,9 +85,8 @@ target_compile_options(gush PRIVATE -Wall -Wextra -Wpedantic)
 install(TARGETS gush DESTINATION bin)
 
 # Test executable for magnet link
-add_executable(test_magnet src/test_magnet.cpp src/magnet.cpp src/utils.cpp)
-target_include_directories(test_magnet PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(test_magnet PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+add_executable(test_magnet src/test_magnet.cpp)
+target_link_libraries(test_magnet PRIVATE gush_lib)
 
 # Unit tests with GoogleTest
 set(TEST_SOURCES
@@ -99,25 +97,10 @@ set(TEST_SOURCES
     tests/test_tracker.cpp
 )
 
-set(TEST_EXTERNAL_SOURCES
-    src/bencode.cpp
-    src/torrent.cpp
-    src/tracker.cpp
-    src/peer.cpp
-    src/downloader.cpp
-    src/utils.cpp
-    src/magnet.cpp
-    src/metadata.cpp
-    src/tracker_list.cpp
-)
-
-add_executable(test_gush ${TEST_SOURCES} ${TEST_EXTERNAL_SOURCES})
-target_include_directories(test_gush PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(test_gush ${TEST_SOURCES})
+target_compile_definitions(test_gush PRIVATE GUSH_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(test_gush PRIVATE
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    CURL::libcurl
-    pthread
+    gush_lib
     GTest::gtest_main
 )
 

@@ -21,8 +21,8 @@ Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath)
 
     piecesCompleted_.resize(torrent.numPieces(), false);
     pieceStates_.reserve(torrent.numPieces());
-    for (uint32_t i = 0; i < torrent.numPieces(); i++) {
-        pieceStates_.emplace_back(calculateBlocksForPiece(i));
+    for (std::size_t i = 0; i < torrent.numPieces(); i++) {
+        pieceStates_.emplace_back(calculateBlocksForPiece(static_cast<uint32_t>(i)));
     }
 }
 
@@ -323,13 +323,13 @@ void Downloader::requestBlocksFromPeer(PeerConnection* peer) {
 
     // Find pieces this peer has that we need
     std::vector<uint32_t> neededPieces;
-    for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+    for (std::size_t i = 0; i < torrent_.numPieces(); i++) {
         if (piecesCompleted_[i]) continue;
-        if (!peer->hasPiece(i)) continue;
+        if (!peer->hasPiece(static_cast<uint32_t>(i))) continue;
 
         // Check if we're already downloading all blocks of this piece
         if (pieceStates_[i].receivedBlocks < pieceStates_[i].totalBlocks) {
-            neededPieces.push_back(i);
+            neededPieces.push_back(static_cast<uint32_t>(i));
         }
     }
 
@@ -392,14 +392,14 @@ uint32_t Downloader::selectNextPiece() {
     std::vector<int> peerCount(torrent_.numPieces(), 0);
     for (const auto& peerPtr : peers_) {
         if (!peerPtr || !peerPtr->isConnected()) continue;
-        for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
-            if (!piecesCompleted_[i] && peerPtr->hasPiece(i)) {
+        for (std::size_t i = 0; i < torrent_.numPieces(); i++) {
+            if (!piecesCompleted_[i] && peerPtr->hasPiece(static_cast<uint32_t>(i))) {
                 peerCount[i]++;
             }
         }
     }
 
-    for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+    for (std::size_t i = 0; i < torrent_.numPieces(); i++) {
         if (piecesCompleted_[i]) continue;
 
         const PieceState& state = pieceStates_[i];
@@ -418,18 +418,18 @@ uint32_t Downloader::selectNextPiece() {
 
         if (score > bestScore) {
             bestScore = score;
-            bestPiece = i;
+            bestPiece = static_cast<uint32_t>(i);
         }
     }
 
     // If no partial pieces, select based on rarest-first
     if (bestPiece == UINT32_MAX) {
         int minPeers = INT32_MAX;
-        for (uint32_t i = 0; i < torrent_.numPieces(); i++) {
+        for (std::size_t i = 0; i < torrent_.numPieces(); i++) {
             if (piecesCompleted_[i]) continue;
             if (peerCount[i] < minPeers) {
                 minPeers = peerCount[i];
-                bestPiece = i;
+                bestPiece = static_cast<uint32_t>(i);
             }
         }
     }

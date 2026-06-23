@@ -17,8 +17,8 @@ int64_t TorrentInfo::totalLength() const {
     return fileLength;
 }
 
-int TorrentInfo::numPieces() const {
-    return static_cast<int>(pieces.size() / 20);  // Each hash is 20 bytes (SHA1)
+std::size_t TorrentInfo::numPieces() const {
+    return pieces.size() / 20;  // Each hash is 20 bytes (SHA1)
 }
 
 std::string generatePeerId() {
