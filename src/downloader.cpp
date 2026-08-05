@@ -82,7 +82,10 @@ bool Downloader::openOutputFiles() {
         f.path = outputPath;
         f.startOffset = 0;
         f.length = total;
-        f.handle = fopen(outputPath.c_str(), "wb");
+        // "w+b": read/write mode. verifyPiece() re-reads each piece from this
+        // same FILE* to check its SHA1, so a write-only "wb" handle would make
+        // every verification fail (fread on a write-only stream is UB).
+        f.handle = fopen(outputPath.c_str(), "w+b");
         if (!f.handle) return false;
         if (!preallocateFile(f.handle, f.length)) {
             fclose(f.handle);
@@ -108,7 +111,8 @@ bool Downloader::openOutputFiles() {
         f.path = outputPath;
         f.startOffset = runningOffset;
         f.length = fileEntry.length;
-        f.handle = fopen(outputPath.c_str(), "wb");
+        // "w+b": read/write mode so verifyPiece() can re-read the piece.
+        f.handle = fopen(outputPath.c_str(), "w+b");
         if (!f.handle) return false;
         if (!preallocateFile(f.handle, f.length)) {
             fclose(f.handle);
@@ -183,6 +187,9 @@ void Downloader::downloadLoop() {
     }
 
     int idleCounter = 0;
+    // Idle detection uses its own snapshot so it does not clobber the
+    // speed-stats sample in updateSpeedStats() (lastDownloadedBytes_).
+    int64_t loopSampleDownloaded = downloadedBytes_;
 
     while (running_ && !stopRequested_) {
         // Connect to peers
@@ -258,12 +265,12 @@ void Downloader::downloadLoop() {
 
         // Check for idle state (no progress) - if tracker re-contact above did not
         // help, keep trying through the manager's backoff schedule
-        if (downloadedBytes_ == lastDownloadedBytes_) {
+        if (downloadedBytes_ == loopSampleDownloaded) {
             idleCounter++;
         } else {
             idleCounter = 0;
         }
-        lastDownloadedBytes_ = downloadedBytes_;
+        loopSampleDownloaded = downloadedBytes_;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(100));  // Increased from 20ms to reduce CPU usage
     }
@@ -598,6 +605,11 @@ void Downloader::processPeerMessages() {
                             break;
                         }
 
+                        // Consume the fulfilled request *before* any further vector
+                        // mutation: later hash-failure cleanup may erase entries of
+                        // this piece, which would otherwise invalidate `it`.
+                        pendingRequests_.erase(it);
+
                         // Write piece (may span multiple files)
                         writePiece(pieceIndex, offset, blockData);
                         {
@@ -630,6 +642,16 @@ void Downloader::processPeerMessages() {
                                 state.blocksRequested.assign(state.totalBlocks, false);
                                 state.blocksReceived.assign(state.totalBlocks, false);
                                 state.receivedBlocks = 0;
+                                // Drop any still-pending requests for this piece so
+                                // late-arriving stale blocks cannot mix into the re-download
+                                for (auto pr = pendingRequests_.begin();
+                                     pr != pendingRequests_.end(); ) {
+                                    if (pr->pieceIndex == pieceIndex) {
+                                        pr = pendingRequests_.erase(pr);
+                                    } else {
+                                        ++pr;
+                                    }
+                                }
                                 // The corrupted data must not be counted towards progress
                                 {
                                     std::lock_guard<std::mutex> lock(mutex_);
@@ -639,9 +661,7 @@ void Downloader::processPeerMessages() {
                             }
                         }
 
-                        // Remove the fulfilled request, then cancel endgame
-                        // duplicates of the same block from other peers
-                        pendingRequests_.erase(it);
+                        // Cancel endgame duplicates of the same block from other peers
                         cancelDuplicateRequests(pieceIndex, offset, peer);
                     }
                     break;

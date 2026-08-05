@@ -87,9 +87,7 @@ target_compile_options(gush PRIVATE ${GUSH_WARNING_FLAGS})
 install(TARGETS gush DESTINATION bin)
 
 # Test executable for magnet link
-add_executable(test_magnet src/test_magnet.cpp)
-target_link_libraries(test_magnet PRIVATE gush_lib)
-target_compile_options(test_magnet PRIVATE ${GUSH_WARNING_FLAGS})
+# (legacy standalone test removed: covered by tests/test_magnet.cpp)
 
 # Unit tests with GoogleTest
 set(TEST_SOURCES
@@ -99,6 +97,7 @@ set(TEST_SOURCES
     tests/test_torrent.cpp
     tests/test_tracker.cpp
     tests/test_tracker_manager.cpp
+    tests/test_downloader.cpp
 )
 
 add_executable(test_gush ${TEST_SOURCES})

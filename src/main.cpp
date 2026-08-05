@@ -140,7 +140,7 @@ void printInfo(const TorrentInfo& torrent) {
 // Create TorrentInfo from magnet link and downloaded metadata
 TorrentInfo createTorrentFromMetadata(const MagnetLink& magnet, const std::string& metadata) {
     TorrentInfo torrent;
-    torrent.infoHash = magnet.infoHashRaw;  // Raw 20-byte SHA1 (see createTorrentFromMetadata)
+    torrent.infoHash = magnet.infoHashRaw;  // Raw 20-byte SHA1, not hex string
     torrent.peerId = generatePeerId();
     torrent.announceList = magnet.trackers;
 

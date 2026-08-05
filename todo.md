@@ -39,11 +39,13 @@
 
 ## P2 - 测试覆盖
 
-- [ ] 补 Downloader 单元/集成测试
-  - 使用本地 socket pair 或 mock peer 验证 block 请求、超时重试、piece 完成和写盘。
+- [x] 补 Downloader 单元/集成测试
+  - `tests/test_downloader.cpp`：本地 mock peer（socket）验证 handshake 分片接收、
+    半包 block 重组、block 请求、piece SHA1 校验、单文件写盘、多文件跨边界写盘。
 
-- [ ] 补 PeerConnection 半包/粘包测试
-  - 覆盖 partial send/recv、keep-alive、超大消息、invalid block offset。
+- [~] 补 PeerConnection 半包/粘包测试
+  - 接收侧半包重组已由 Downloader 集成测试覆盖（mock peer 分片发送）；
+  - 仍缺：PeerConnection 独立测试（keep-alive、超大消息、invalid block offset）。
 
 - [ ] 恢复并修正多文件 torrent 测试
   - `tests/test_torrent.cpp` 中已有被注释的多文件测试。
@@ -79,6 +81,14 @@
 
 - [x] 增加 GitHub Actions
   - Linux Debug/Release 构建 + 运行 `ctest --output-on-failure` + ASan/UBSan。
+
+- [x] 修复下载核心 bug（本轮 ASan + 集成测试发现）
+  - `fopen(..., "wb")` 只写模式导致 `verifyPiece` 的 fread 永远失败（UB），
+    所有 piece 校验必然失败、下载永远无法完成 → 改为 `"w+b"`。
+  - piece hash 失败时清理 `pendingRequests_` 会使当前迭代器失效，随后双重
+    erase 导致崩溃 → 先消费当前请求再清理。
+  - `updateSpeedStats` 的采样值被下载循环每 100ms 覆盖，速度恒为 0 →
+    idle 检测改用独立局部快照。
 
 ## 推荐执行顺序
 
