@@ -261,6 +261,11 @@ bool PeerConnection::performHandshake() {
     
     // Get peer ID (optional, store if needed)
 
+    // BEP 3: the bitfield message is optional - peers that omit it announce
+    // availability via have messages instead. Initialise the bitfield so those
+    // have messages are not silently dropped.
+    bitfield_.assign(torrent_.numPieces(), false);
+
     // Send interested (to let peer know we want data)
     sendInterested();
     
@@ -289,7 +294,13 @@ bool PeerConnection::sendMessage(const PeerMessage& msg) {
         buffer.insert(buffer.end(), msg.payload.begin(), msg.payload.end());
     }
     
-    return sendAll(socket_, buffer.data(), buffer.size());
+    if (!sendAll(socket_, buffer.data(), buffer.size())) {
+        // Broken pipe / peer gone: reflect it in our state so the download
+        // loop stops scheduling requests against this connection.
+        disconnect();
+        return false;
+    }
+    return true;
 }
 
 bool PeerConnection::sendChoke() {
@@ -334,6 +345,10 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
                  static_cast<uint32_t>(lengthBuf[3]);
 
     if (msg.length > MAX_PEER_MESSAGE_SIZE) {
+        // A peer that sends an absurd frame length is either broken or hostile;
+        // leave the socket buffer clean by dropping the connection instead of
+        // returning false forever with the frame still queued.
+        disconnect();
         return false;
     }
 
@@ -423,9 +438,19 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
                  (static_cast<uint32_t>(lengthBuf[2]) << 8) |
                  static_cast<uint32_t>(lengthBuf[3]);
 
-    if (msg.length > MAX_PEER_MESSAGE_SIZE ||
-        available < static_cast<int64_t>(4 + msg.length)) {
+    msg.length = (static_cast<uint32_t>(lengthBuf[0]) << 24) |
+                 (static_cast<uint32_t>(lengthBuf[1]) << 16) |
+                 (static_cast<uint32_t>(lengthBuf[2]) << 8) |
+                 static_cast<uint32_t>(lengthBuf[3]);
+
+    if (msg.length > MAX_PEER_MESSAGE_SIZE) {
+        // Same as receiveMessage(): drop the connection on an absurd frame.
+        disconnect();
         return false;
+    }
+
+    if (available < static_cast<int64_t>(4 + msg.length)) {
+        return false;  // Partial frame: keep it queued, retry next poll
     }
 
     if (!recvAll(socket_, lengthBuf, 4, MSG_DONTWAIT)) {

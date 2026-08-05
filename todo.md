@@ -43,16 +43,21 @@
   - `tests/test_downloader.cpp`：本地 mock peer（socket）验证 handshake 分片接收、
     半包 block 重组、block 请求、piece SHA1 校验、单文件写盘、多文件跨边界写盘。
 
-- [~] 补 PeerConnection 半包/粘包测试
-  - 接收侧半包重组已由 Downloader 集成测试覆盖（mock peer 分片发送）；
-  - 仍缺：PeerConnection 独立测试（keep-alive、超大消息、invalid block offset）。
+- [x] 补 PeerConnection 半包/粘包测试
+  - `tests/test_peer_connection.cpp`：本地 mock peer 覆盖握手字节校验、
+    request/cancel 编码、分片 keep-alive/have/unchoke、超大帧断开、
+    invalid block offset 拒绝、choke 状态更新。
+  - 顺带发现并修复：bitfield_ 未初始化，不发 bitfield 的 peer 其 have 消息
+    全部被丢弃；超大帧/发送失败时自动断开连接。
 
 - [ ] 恢复并修正多文件 torrent 测试
   - `tests/test_torrent.cpp` 中已有被注释的多文件测试。
   - 改成稳定构造 bencode fixture 后启用。
 
-- [ ] 增加 metadata downloader 测试
-  - 覆盖 BEP 9 extension handshake、metadata 分片拼接、hash mismatch 和 peer reject。
+- [x] 增加 metadata downloader 测试
+  - `tests/test_metadata.cpp`：本地 mock peer 模拟 BEP 9/10 扩展握手（分片）、
+    metadata 两片拼接（第二片分片传输）、单小片、peer reject、
+    hash mismatch、size mismatch。
 
 - [x] 增加 TrackerManager 单元测试
   - 覆盖退避、成功复位、优先级排序、去重和超时恢复。

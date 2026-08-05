@@ -98,6 +98,8 @@ set(TEST_SOURCES
     tests/test_tracker.cpp
     tests/test_tracker_manager.cpp
     tests/test_downloader.cpp
+    tests/test_peer_connection.cpp
+    tests/test_metadata.cpp
 )
 
 add_executable(test_gush ${TEST_SOURCES})
