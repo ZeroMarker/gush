@@ -16,7 +16,8 @@ constexpr uint32_t MAX_PEER_MESSAGE_SIZE = 4 * 1024 * 1024;
 bool sendAll(int socket, const uint8_t* data, size_t size) {
     size_t totalSent = 0;
     while (totalSent < size) {
-        ssize_t sent = send(socket, data + totalSent, size - totalSent, 0);
+        // MSG_NOSIGNAL: a peer disconnect must not kill the process via SIGPIPE
+        ssize_t sent = send(socket, data + totalSent, size - totalSent, MSG_NOSIGNAL);
         if (sent < 0 && errno == EINTR) {
             continue;
         }
@@ -137,10 +138,14 @@ bool PeerConnection::connect() {
     fcntl(socket_, F_SETFL, flags | O_NONBLOCK);
     
     // Set up address
-    struct sockaddr_in addr;
+    struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port_);
-    inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr);
+    if (inet_pton(AF_INET, ip_.c_str(), &addr.sin_addr) != 1) {
+        // Not a valid IPv4 address (e.g. a hostname from a non-compact tracker)
+        disconnect();
+        return false;
+    }
 
     // Set socket options for keep-alive
     int keepAlive = 1;

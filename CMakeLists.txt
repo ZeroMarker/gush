@@ -79,7 +79,8 @@ add_executable(gush src/main.cpp)
 target_link_libraries(gush PRIVATE gush_lib)
 
 # Compiler warnings
-target_compile_options(gush PRIVATE -Wall -Wextra -Wpedantic)
+set(GUSH_WARNING_FLAGS -Wall -Wextra -Wpedantic)
+target_compile_options(gush PRIVATE ${GUSH_WARNING_FLAGS})
 
 # Install target
 install(TARGETS gush DESTINATION bin)
@@ -87,6 +88,7 @@ install(TARGETS gush DESTINATION bin)
 # Test executable for magnet link
 add_executable(test_magnet src/test_magnet.cpp)
 target_link_libraries(test_magnet PRIVATE gush_lib)
+target_compile_options(test_magnet PRIVATE ${GUSH_WARNING_FLAGS})
 
 # Unit tests with GoogleTest
 set(TEST_SOURCES
@@ -99,6 +101,7 @@ set(TEST_SOURCES
 
 add_executable(test_gush ${TEST_SOURCES})
 target_compile_definitions(test_gush PRIVATE GUSH_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_options(test_gush PRIVATE ${GUSH_WARNING_FLAGS})
 target_link_libraries(test_gush PRIVATE
     gush_lib
     GTest::gtest_main

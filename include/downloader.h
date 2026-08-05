@@ -10,6 +10,8 @@
 #include <mutex>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <map>
 #include <thread>
 
 struct DownloadStats {
@@ -56,6 +58,9 @@ public:
     // Stop download
     void stop();
 
+    // Request stop without joining the download thread (safe from signal handlers)
+    void requestStop() { stopRequested_ = true; running_ = false; }
+
     // Check if downloading
     bool isRunning() const { return running_; }
 
@@ -80,14 +85,27 @@ private:
     void requestPieces();
     void requestBlocksFromPeer(PeerConnection* peer);
     void processPeerMessages();
-    void verifyPiece(uint32_t index, const std::vector<uint8_t>& data);
+    bool verifyPiece(uint32_t index);
     void writePiece(uint32_t index, uint32_t offset, const std::vector<uint8_t>& data);
+    bool readPieceFromDisk(uint32_t index, std::vector<uint8_t>& data);
     bool hasPiece(uint32_t index) const;
     uint32_t selectNextPiece();
     void updateSpeedStats();
     int calculateBlocksForPiece(uint32_t pieceIndex) const;
+    int64_t pieceSize(uint32_t pieceIndex) const;
     void cleanupTimedOutRequests();
     void cancelRequestsForPeer(PeerConnection* peer);
+
+    // Output file management (single- and multi-file torrents)
+    struct OutputFile {
+        std::string path;        // Full path on disk
+        int64_t startOffset = 0; // Absolute byte offset within the torrent
+        int64_t length = 0;      // Size of this file
+        FILE* handle = nullptr;
+    };
+    bool openOutputFiles();
+    void closeOutputFiles();
+    static bool preallocateFile(FILE* f, int64_t size);
 
     TorrentInfo torrent_;
     std::string savePath_;
@@ -137,8 +155,8 @@ private:
     };
     std::map<PeerConnection*, PeerSpeedStats> peerSpeedStats_;
 
-    // File handle for writing
-    FILE* outputFile_ = nullptr;
+    // Output file handles (single- or multi-file)
+    std::vector<OutputFile> outputFiles_;
     
     // Mutex for thread safety
     mutable std::mutex mutex_;

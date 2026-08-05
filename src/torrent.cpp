@@ -39,6 +39,37 @@ std::string generatePeerId() {
     return oss.str();
 }
 
+// Try to extract the exact byte span of the root "info" dictionary from the raw
+// torrent content. Re-encoding the parsed value is NOT byte-identical for
+// non-canonical encodings (e.g. i-0e, leading zeros, non-minimal integers), which
+// would change the info hash and break the torrent.
+std::string extractInfoDictBytes(const std::string& content,
+                                 const bencode::BencodeValue& parsedInfo) {
+    size_t pos = 0;
+    while ((pos = content.find("4:info", pos)) != std::string::npos) {
+        // The key must sit at a dictionary-key position: preceded by 'd' (first
+        // key) or by 'e' (end of the previous value).
+        bool validStart = (pos == 0) || content[pos - 1] == 'd' || content[pos - 1] == 'e';
+        if (validStart) {
+            size_t endPos = pos + 6;  // Skip the "4:info" key
+            try {
+                bencode::BencodeValue v = bencode::parse(content, endPos);
+                // Confirm this is the info dict (has the mandatory keys)
+                if (v.isDict() &&
+                    bencode::dictGet(v.asDict(), "pieces") &&
+                    bencode::dictGet(v.asDict(), "piece length")) {
+                    return content.substr(pos + 6, endPos - (pos + 6));
+                }
+            } catch (...) {
+                // Not a valid value at this position; keep searching
+            }
+        }
+        pos += 6;
+    }
+    // Fallback: canonical re-encode of the parsed info dict
+    return bencode::encode(parsedInfo);
+}
+
 TorrentInfo loadTorrent(const std::string& filename) {
     // Read torrent file
     std::ifstream file(filename, std::ios::binary);
@@ -159,8 +190,8 @@ TorrentInfo loadTorrent(const std::string& filename) {
         torrent.fileName = torrent.name;
     }
     
-    // Calculate info hash (SHA1 of bencoded info dict)
-    std::string infoEncoded = bencode::encode(*info);
+    // Calculate info hash (SHA1 of the ORIGINAL bencoded info dict bytes)
+    std::string infoEncoded = extractInfoDictBytes(content, *info);
     torrent.infoHash = utils::sha1(infoEncoded);
     
     return torrent;

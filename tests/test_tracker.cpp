@@ -7,10 +7,10 @@
 TEST(TrackerTest, ParseCompactPeers) {
     // 2 peers: 127.0.0.1:6881 and 192.168.1.1:8080
     std::string data;
-    data.push_back(0x7f); data.push_back(0x00); data.push_back(0x00); data.push_back(0x01);  // 127.0.0.1
-    data.push_back(0x1a); data.push_back(0xe1);  // 6881
-    data.push_back(0xc0); data.push_back(0xa8); data.push_back(0x01); data.push_back(0x01);  // 192.168.1.1
-    data.push_back(0x1f); data.push_back(0x90);  // 8080
+    data.push_back(static_cast<char>(0x7f)); data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x01));  // 127.0.0.1
+    data.push_back(static_cast<char>(0x1a)); data.push_back(static_cast<char>(0xe1));  // 6881
+    data.push_back(static_cast<char>(0xc0)); data.push_back(static_cast<char>(0xa8)); data.push_back(static_cast<char>(0x01)); data.push_back(static_cast<char>(0x01));  // 192.168.1.1
+    data.push_back(static_cast<char>(0x1f)); data.push_back(static_cast<char>(0x90));  // 8080
 
     std::vector<Peer> peers = parseCompactPeers(data);
 
@@ -161,16 +161,16 @@ TEST(TrackerTest, ParseCompactPeersVariousIPs) {
     std::string data;
 
     // 0.0.0.0:1
-    data.push_back(0x00); data.push_back(0x00); data.push_back(0x00); data.push_back(0x00);
-    data.push_back(0x00); data.push_back(0x01);
+    data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x00));
+    data.push_back(static_cast<char>(0x00)); data.push_back(static_cast<char>(0x01));
 
     // 255.255.255.255:65535
-    data.push_back(0xff); data.push_back(0xff); data.push_back(0xff); data.push_back(0xff);
-    data.push_back(0xff); data.push_back(0xff);
+    data.push_back(static_cast<char>(0xff)); data.push_back(static_cast<char>(0xff)); data.push_back(static_cast<char>(0xff)); data.push_back(static_cast<char>(0xff));
+    data.push_back(static_cast<char>(0xff)); data.push_back(static_cast<char>(0xff));
 
     // 10.20.30.40:12345
-    data.push_back(0x0a); data.push_back(0x14); data.push_back(0x1e); data.push_back(0x28);
-    data.push_back(0x30); data.push_back(0x39);
+    data.push_back(static_cast<char>(0x0a)); data.push_back(static_cast<char>(0x14)); data.push_back(static_cast<char>(0x1e)); data.push_back(static_cast<char>(0x28));
+    data.push_back(static_cast<char>(0x30)); data.push_back(static_cast<char>(0x39));
 
     std::vector<Peer> peers = parseCompactPeers(data);
 

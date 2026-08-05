@@ -141,6 +141,19 @@ std::vector<Peer> parsePeers(const bencode::BencodeValue& peers) {
 // UDP Tracker support (BEP 15)
 namespace {
 
+// Return the raw 20-byte info hash, accepting both conventions:
+//  - raw 20-byte SHA1 (as produced by TorrentInfo after loadTorrent)
+//  - 40-char hex string (as produced by magnet parsing / tests)
+std::string rawInfoHash(const TorrentInfo& torrent) {
+    if (torrent.infoHash.size() == 40) {
+        std::string raw = utils::fromHex(torrent.infoHash);
+        if (raw.size() == 20) return raw;
+    }
+    if (torrent.infoHash.size() == 20) return torrent.infoHash;
+    // Last resort: attempt hex decoding (empty on failure)
+    return utils::fromHex(torrent.infoHash);
+}
+
 bool parseUdpUrl(const std::string& url, std::string& host, uint16_t& port) {
     // Format: udp://host:port/path
     if (url.substr(0, 6) != "udp://") return false;
@@ -241,13 +254,19 @@ TrackerResponse contactUdpTracker(
     }
     
     uint64_t connectionId = be64toh(connectResp.connection_id);
-    
+
     // Send announce request
     udp_tracker::AnnounceRequest announceReq;
     announceReq.connection_id = htobe64(connectionId);
     announceReq.action = htobe32(1);  // Announce
     announceReq.transaction_id = htobe32(transactionId);
-    memcpy(announceReq.info_hash, torrent.infoHash.c_str(), 20);
+    const std::string infoHash = rawInfoHash(torrent);
+    if (infoHash.size() != 20 || peerId.size() != 20) {
+        close(sock);
+        response.failure = "Invalid info hash or peer ID";
+        return response;
+    }
+    memcpy(announceReq.info_hash, infoHash.c_str(), 20);
     memcpy(announceReq.peer_id, peerId.c_str(), 20);
     announceReq.downloaded = htobe64(downloaded);
     announceReq.left = htobe64(left);
@@ -335,9 +354,12 @@ TrackerResponse contactTracker(
 
     // Add required parameters
     // Note: info_hash must be the raw 20-byte binary data, URL-encoded
-    // torrent.infoHash is in hex format, so we need to convert it back to raw bytes
-    std::string rawInfoHash = utils::fromHex(torrent.infoHash);
-    url << "info_hash=" << utils::urlEncode(rawInfoHash);
+    std::string infoHashBytes = rawInfoHash(torrent);
+    if (infoHashBytes.size() != 20 || peerId.size() != 20) {
+        response.failure = "Invalid info hash or peer ID";
+        return response;
+    }
+    url << "info_hash=" << utils::urlEncode(infoHashBytes);
     url << "&peer_id=" << utils::urlEncode(peerId);
     url << "&port=6881";
     url << "&uploaded=" << uploaded;
@@ -362,8 +384,9 @@ TrackerResponse contactTracker(
     curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);  // Increased redirect limit
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);    // Increased timeout for slow trackers
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);  // Connection timeout
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);    // Bounded so shutdown stays responsive
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);  // Connection timeout
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseData);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Gush/1.0");

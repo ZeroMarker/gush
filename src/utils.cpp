@@ -131,17 +131,82 @@ std::string formatTime(int64_t seconds) {
 }
 
 bool createDirectory(std::string_view path) {
-    const std::string pathStr(path);
-    if (mkdir(pathStr.c_str(), 0755) == 0) {
-        return true;
-    }
+    return createDirectories(path);
+}
 
-    if (errno != EEXIST) {
-        return false;
+bool createDirectories(std::string_view path) {
+    if (path.empty()) return false;
+
+    std::string p(path);
+    // Strip trailing slashes
+    while (!p.empty() && p.back() == '/') {
+        p.pop_back();
     }
+    if (p.empty()) return false;
 
     struct stat st;
-    return stat(pathStr.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (stat(p.c_str(), &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    // Create each intermediate component
+    size_t pos = p.find('/');
+    while (pos != std::string::npos) {
+        std::string part = p.substr(0, pos);
+        if (!part.empty()) {
+            if (mkdir(part.c_str(), 0755) != 0 && errno != EEXIST) {
+                return false;
+            }
+        }
+        pos = p.find('/', pos + 1);
+    }
+
+    if (mkdir(p.c_str(), 0755) != 0 && errno != EEXIST) {
+        return false;
+    }
+    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+std::string sanitizeFileName(std::string_view name) {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        // Replace separators, NUL and control characters
+        if (c == '/' || c == '\\' || c == '\0' || uc < 0x20) {
+            out += '_';
+        } else {
+            out += c;
+        }
+    }
+    return out;  // Caller decides how to handle "", "." and ".."
+}
+
+std::string sanitizePath(std::string_view path) {
+    std::ostringstream oss;
+    size_t pos = 0;
+    bool first = true;
+
+    while (pos <= path.size()) {
+        size_t slash = path.find('/', pos);
+        std::string_view comp = (slash == std::string_view::npos)
+            ? path.substr(pos)
+            : path.substr(pos, slash - pos);
+
+        std::string safe = sanitizeFileName(comp);
+        // Drop empty, '.' and '..' components (also blocks absolute paths)
+        if (!safe.empty() && safe != "." && safe != "..") {
+            if (!first) oss << '/';
+            oss << safe;
+            first = false;
+        }
+
+        if (slash == std::string_view::npos) break;
+        pos = slash + 1;
+    }
+
+    std::string result = oss.str();
+    return result.empty() ? "_" : result;
 }
 
 int64_t getFileSize(std::string_view path) {

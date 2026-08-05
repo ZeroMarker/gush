@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+build*/
+*.o
+*.a
+*.so
+CMakeCache.txt
+CMakeFiles/
+
+# Editor / OS caches
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Downloaded / generated files
+downloads/
+*.torrent

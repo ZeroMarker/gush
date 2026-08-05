@@ -28,53 +28,117 @@ Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath)
 
 Downloader::~Downloader() {
     stop();
-    if (outputFile_) {
-        fclose(outputFile_);
-    }
+    closeOutputFiles();
 }
 
 void Downloader::start() {
     if (running_) return;
-    
+
     running_ = true;
     stopRequested_ = false;
-    
-    // Open output file
-    std::string outputPath = savePath_ + "/" + torrent_.name;
-    outputFile_ = fopen(outputPath.c_str(), "wb");
-    if (!outputFile_) {
-        std::cerr << "Failed to create output file: " << outputPath << std::endl;
+
+    // Create the save directory if it does not exist yet
+    if (!utils::createDirectories(savePath_)) {
+        std::cerr << "Failed to create output directory: " << savePath_ << std::endl;
         running_ = false;
         return;
     }
-    
-    // Pre-allocate file
-    int64_t totalSize = torrent_.totalLength();
-    if (totalSize > 0) {
-        if (fseeko(outputFile_, totalSize - 1, SEEK_SET) != 0 ||
-            fputc(0, outputFile_) == EOF ||
-            fflush(outputFile_) != 0 ||
-            fseeko(outputFile_, 0, SEEK_SET) != 0) {
-            std::cerr << "Failed to pre-allocate output file: " << outputPath << std::endl;
-            fclose(outputFile_);
-            outputFile_ = nullptr;
-            running_ = false;
-            return;
-        }
+
+    // Open output file(s): single file or one per FileEntry
+    if (!openOutputFiles()) {
+        std::cerr << "Failed to create output files under: " << savePath_ << std::endl;
+        closeOutputFiles();
+        running_ = false;
+        return;
     }
-    
+
     // Start download loop in separate thread
     downloadThread_ = std::thread(&Downloader::downloadLoop, this);
+}
+
+bool Downloader::preallocateFile(FILE* f, int64_t size) {
+    if (size <= 0) return true;
+    return fseeko(f, size - 1, SEEK_SET) == 0 &&
+           fputc(0, f) != EOF &&
+           fflush(f) == 0 &&
+           fseeko(f, 0, SEEK_SET) == 0;
+}
+
+bool Downloader::openOutputFiles() {
+    closeOutputFiles();
+
+    const int64_t total = torrent_.totalLength();
+    if (total < 0) return false;
+
+    if (!torrent_.isMultiFile()) {
+        // Single file mode: savePath/name
+        const std::string safeName = utils::sanitizeFileName(
+            torrent_.name.empty() ? torrent_.fileName : torrent_.name);
+        const std::string outputPath = savePath_ + "/" + safeName;
+
+        OutputFile f;
+        f.path = outputPath;
+        f.startOffset = 0;
+        f.length = total;
+        f.handle = fopen(outputPath.c_str(), "wb");
+        if (!f.handle) return false;
+        if (!preallocateFile(f.handle, f.length)) {
+            fclose(f.handle);
+            return false;
+        }
+        outputFiles_.push_back(f);
+        return true;
+    }
+
+    // Multi-file mode: create directories and one file per FileEntry
+    int64_t runningOffset = 0;
+    for (const auto& fileEntry : torrent_.files) {
+        const std::string relPath = utils::sanitizePath(fileEntry.path);
+        const std::string outputPath = savePath_ + "/" + relPath;
+
+        // Create parent directories (may be nested)
+        const size_t slash = outputPath.find_last_of('/');
+        if (slash != std::string::npos && !utils::createDirectories(outputPath.substr(0, slash))) {
+            return false;
+        }
+
+        OutputFile f;
+        f.path = outputPath;
+        f.startOffset = runningOffset;
+        f.length = fileEntry.length;
+        f.handle = fopen(outputPath.c_str(), "wb");
+        if (!f.handle) return false;
+        if (!preallocateFile(f.handle, f.length)) {
+            fclose(f.handle);
+            return false;
+        }
+        outputFiles_.push_back(f);
+        runningOffset += fileEntry.length;
+    }
+    return true;
+}
+
+void Downloader::closeOutputFiles() {
+    for (auto& f : outputFiles_) {
+        if (f.handle) {
+            fclose(f.handle);
+            f.handle = nullptr;
+        }
+    }
+    outputFiles_.clear();
 }
 
 void Downloader::stop() {
     stopRequested_ = true;
     running_ = false;
-    
+
     // Disconnect all peers
-    for (auto& peer : peers_) {
-        if (peer) {
-            peer->disconnect();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& peer : peers_) {
+            if (peer) {
+                peer->disconnect();
+            }
         }
     }
 
@@ -83,7 +147,10 @@ void Downloader::stop() {
         downloadThread_.join();
     }
 
-    peers_.clear();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        peers_.clear();
+    }
 }
 
 void Downloader::downloadLoop() {
@@ -515,26 +582,66 @@ void Downloader::processPeerMessages() {
                         // Extract block data
                         std::vector<uint8_t> blockData(msg.payload.begin() + 8, msg.payload.end());
 
-                        // Write piece
+                        // Protocol check: block must match the requested length
+                        if (blockData.size() != it->length) {
+                            PieceState& state = pieceStates_[pieceIndex];
+                            int blockIndex = offset / blockSize;
+                            if (blockIndex < state.totalBlocks) {
+                                state.blocksRequested[blockIndex] = false;
+                            }
+                            peerSpeedStats_[peer].failedRequests++;
+                            pendingRequests_.erase(it);
+                            break;
+                        }
+
+                        // Validate block index before writing
+                        PieceState& state = pieceStates_[pieceIndex];
+                        int blockIndex = offset / blockSize;
+                        if (blockIndex >= state.totalBlocks ||
+                            state.blocksReceived[blockIndex]) {
+                            // Unknown or duplicate block: drop it
+                            peerSpeedStats_[peer].failedRequests++;
+                            pendingRequests_.erase(it);
+                            break;
+                        }
+
+                        // Write piece (may span multiple files)
                         writePiece(pieceIndex, offset, blockData);
-                        downloadedBytes_ += blockData.size();
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            downloadedBytes_ += blockData.size();
+                        }
 
                         // Update peer speed stats
                         peerSpeedStats_[peer].updateSpeed(blockData.size());
 
                         // Mark block as received
-                        PieceState& state = pieceStates_[pieceIndex];
-                        int blockIndex = offset / blockSize;
-                        if (blockIndex < state.totalBlocks && !state.blocksReceived[blockIndex]) {
-                            state.blocksReceived[blockIndex] = true;
-                            state.receivedBlocks++;
+                        state.blocksReceived[blockIndex] = true;
+                        state.receivedBlocks++;
 
-                            // Check if piece is complete
-                            if (state.receivedBlocks >= state.totalBlocks) {
-                                piecesCompleted_[pieceIndex] = true;
-                                piecesCompletedCount_++;
+                        // Check if piece is complete
+                        if (state.receivedBlocks >= state.totalBlocks) {
+                            if (verifyPiece(pieceIndex)) {
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    piecesCompleted_[pieceIndex] = true;
+                                    piecesCompletedCount_++;
+                                }
                                 std::cout << "Piece " << pieceIndex << " complete ("
                                           << piecesCompletedCount_ << "/" << torrent_.numPieces() << ")" << std::endl;
+                            } else {
+                                // SHA1 mismatch: reset the piece so it gets re-requested
+                                std::cerr << "Piece " << pieceIndex
+                                          << " failed hash check, re-requesting" << std::endl;
+                                state.blocksRequested.assign(state.totalBlocks, false);
+                                state.blocksReceived.assign(state.totalBlocks, false);
+                                state.receivedBlocks = 0;
+                                // The corrupted data must not be counted towards progress
+                                {
+                                    std::lock_guard<std::mutex> lock(mutex_);
+                                    downloadedBytes_ = std::max<int64_t>(0,
+                                        downloadedBytes_ - pieceSize(pieceIndex));
+                                }
                             }
                         }
 
@@ -598,6 +705,7 @@ void Downloader::updateSpeedStats() {
         now - lastSpeedUpdateTime_).count();
     
     if (elapsed >= 1) {
+        std::lock_guard<std::mutex> lock(mutex_);
         int64_t delta = downloadedBytes_ - lastDownloadedBytes_;
         currentSpeed_ = static_cast<double>(delta) / elapsed;
         lastSpeedUpdateTime_ = now;
@@ -607,19 +715,97 @@ void Downloader::updateSpeedStats() {
 
 int Downloader::calculateBlocksForPiece(uint32_t pieceIndex) const {
     const uint32_t blockSize = 16384;  // 16 KB
-    int64_t pieceStart = static_cast<int64_t>(pieceIndex) * torrent_.pieceLength;
-    int64_t pieceEnd = std::min(pieceStart + torrent_.pieceLength, torrent_.totalLength());
-    int64_t pieceSize = pieceEnd - pieceStart;
-    return (pieceSize + blockSize - 1) / blockSize;
+    int64_t bytesInPiece = this->pieceSize(pieceIndex);
+    return (bytesInPiece + blockSize - 1) / blockSize;
+}
+
+int64_t Downloader::pieceSize(uint32_t pieceIndex) const {
+    int64_t start = static_cast<int64_t>(pieceIndex) * torrent_.pieceLength;
+    return std::min<int64_t>(torrent_.pieceLength, torrent_.totalLength() - start);
 }
 
 void Downloader::writePiece(uint32_t index, uint32_t offset, const std::vector<uint8_t>& data) {
-    if (!outputFile_) return;
-    
-    int64_t fileOffset = static_cast<int64_t>(index) * torrent_.pieceLength + offset;
-    
-    fseeko(outputFile_, fileOffset, SEEK_SET);
-    fwrite(data.data(), 1, data.size(), outputFile_);
+    if (outputFiles_.empty()) return;
+
+    int64_t absOffset = static_cast<int64_t>(index) * torrent_.pieceLength + offset;
+    size_t pos = 0;
+    size_t fi = 0;
+
+    // Blocks may straddle file boundaries in multi-file torrents
+    while (pos < data.size() && fi < outputFiles_.size()) {
+        const OutputFile& f = outputFiles_[fi];
+        if (absOffset >= f.startOffset + f.length) {
+            ++fi;  // This file is entirely before the write position
+            continue;
+        }
+        if (absOffset < f.startOffset) {
+            return;  // Write position is before the first file (should not happen)
+        }
+
+        int64_t within = absOffset - f.startOffset;
+        int64_t avail = f.length - within;
+        if (avail <= 0) {
+            ++fi;
+            continue;
+        }
+
+        size_t chunk = static_cast<size_t>(std::min<int64_t>(data.size() - pos, avail));
+        if (fseeko(f.handle, within, SEEK_SET) != 0) return;
+        if (fwrite(data.data() + pos, 1, chunk, f.handle) != chunk) return;
+
+        pos += chunk;
+        absOffset += static_cast<int64_t>(chunk);
+    }
+}
+
+bool Downloader::readPieceFromDisk(uint32_t index, std::vector<uint8_t>& data) {
+    if (outputFiles_.empty()) return false;
+
+    const int64_t pieceBytes = pieceSize(index);
+    if (pieceBytes <= 0) return false;
+    data.assign(static_cast<size_t>(pieceBytes), 0);
+
+    int64_t absOffset = static_cast<int64_t>(index) * torrent_.pieceLength;
+    size_t pos = 0;
+    size_t fi = 0;
+
+    while (pos < data.size() && fi < outputFiles_.size()) {
+        const OutputFile& f = outputFiles_[fi];
+        if (absOffset >= f.startOffset + f.length) {
+            ++fi;
+            continue;
+        }
+        if (absOffset < f.startOffset) return false;
+
+        int64_t within = absOffset - f.startOffset;
+        int64_t avail = f.length - within;
+        if (avail <= 0) {
+            ++fi;
+            continue;
+        }
+
+        size_t chunk = static_cast<size_t>(std::min<int64_t>(data.size() - pos, avail));
+        if (fseeko(f.handle, within, SEEK_SET) != 0) return false;
+        if (fread(data.data() + pos, 1, chunk, f.handle) != chunk) return false;
+
+        pos += chunk;
+        absOffset += static_cast<int64_t>(chunk);
+    }
+
+    return pos == data.size();
+}
+
+bool Downloader::verifyPiece(uint32_t index) {
+    // Read the piece back from disk and check its SHA1 against the torrent
+    std::vector<uint8_t> data;
+    if (!readPieceFromDisk(index, data)) return false;
+
+    const std::string& expected = torrent_.pieces;
+    const size_t hashOffset = static_cast<size_t>(index) * 20;
+    if (expected.size() < hashOffset + 20) return false;
+
+    std::string actual = utils::sha1(data.data(), data.size());
+    return actual == expected.substr(hashOffset, 20);
 }
 
 bool Downloader::hasPiece(uint32_t index) const {
@@ -627,22 +813,26 @@ bool Downloader::hasPiece(uint32_t index) const {
 }
 
 bool Downloader::isComplete() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return piecesCompletedCount_ >= torrent_.numPieces();
 }
 
 double Downloader::getProgress() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (torrent_.numPieces() == 0) return 0.0;
     return static_cast<double>(piecesCompletedCount_) / torrent_.numPieces();
 }
 
 DownloadStats Downloader::getStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     DownloadStats stats;
     stats.downloaded = downloadedBytes_;
     stats.uploaded = uploadedBytes_;
     stats.totalLength = torrent_.totalLength();
     stats.downloadSpeed = currentSpeed_;
     stats.currentSpeed = currentSpeed_;
-    stats.progress = getProgress();
+    stats.progress = static_cast<double>(piecesCompletedCount_) /
+                     (torrent_.numPieces() > 0 ? torrent_.numPieces() : 1);
     stats.connectedPeers = static_cast<int>(peers_.size());
     stats.activePeers = 0;
 
@@ -656,6 +846,7 @@ DownloadStats Downloader::getStats() const {
 }
 
 void Downloader::addPeers(const std::vector<Peer>& peers) {
+    std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& peer : peers) {
         // Check if already connected
         bool exists = false;

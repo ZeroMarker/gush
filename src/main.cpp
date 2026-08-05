@@ -10,13 +10,18 @@
 #include <chrono>
 #include <signal.h>
 #include <iomanip>
+#include <atomic>
 
 static Downloader* g_downloader = nullptr;
+static std::atomic<bool> g_interrupt{false};
 
 void signalHandler(int /*signum*/) {
     std::cout << "\nInterrupt received, stopping download..." << std::endl;
+    g_interrupt = true;
     if (g_downloader) {
-        g_downloader->stop();
+        // Only flip atomics here: joining the download thread from a signal
+        // handler is not async-signal-safe and can deadlock.
+        g_downloader->requestStop();
     }
 }
 
@@ -57,7 +62,7 @@ void printInfo(const TorrentInfo& torrent) {
 // Create TorrentInfo from magnet link and downloaded metadata
 TorrentInfo createTorrentFromMetadata(const MagnetLink& magnet, const std::string& metadata) {
     TorrentInfo torrent;
-    torrent.infoHash = magnet.infoHash;
+    torrent.infoHash = magnet.infoHashRaw;  // Raw 20-byte SHA1 (see createTorrentFromMetadata)
     torrent.peerId = generatePeerId();
     torrent.announceList = magnet.trackers;
 
@@ -224,7 +229,7 @@ int main(int argc, char* argv[]) {
 
         // Show progress
         auto lastUpdate = std::chrono::steady_clock::now();
-        while (downloader.isRunning()) {
+        while (downloader.isRunning() && !g_interrupt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             auto now = std::chrono::steady_clock::now();
@@ -248,6 +253,9 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
+
+        // Join the download thread from the main thread (never from a signal handler)
+        downloader.stop();
 
         std::cout << std::endl;
 

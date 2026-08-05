@@ -68,7 +68,7 @@ void testGenerateMagnet() {
     
     std::string magnet = generateMagnetLink(infoHashRaw, displayName, trackers);
     
-    assert(magnet.substr(0, 9) == "magnet:?");
+    assert(magnet.rfind("magnet:?xt=urn:btih:", 0) == 0);
     assert(magnet.find("xt=urn:btih:66a9f29746ced3e9ea6e4e1a5e5e5e5e5e5e5e5e") != std::string::npos);
     assert(magnet.find("dn=GeneratedTest") != std::string::npos);
     

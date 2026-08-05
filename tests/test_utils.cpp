@@ -233,3 +233,53 @@ TEST(UtilsTest, PathFunctionsAcceptNonNullTerminatedStringView) {
 
     std::filesystem::remove(testFile);
 }
+
+// Test createDirectories (recursive mkdir -p)
+TEST(UtilsTest, CreateDirectoriesRecursive) {
+    const auto base = std::filesystem::temp_directory_path() / "gush_test_nested";
+    const auto nested = base / "a" / "b" / "c";
+    std::filesystem::remove_all(base);
+
+    EXPECT_TRUE(utils::createDirectories(nested.string()));
+    EXPECT_TRUE(std::filesystem::is_directory(nested));
+
+    // Idempotent
+    EXPECT_TRUE(utils::createDirectories(nested.string()));
+
+    // Existing file is not a directory
+    const auto file = base / "afile";
+    {
+        std::ofstream f(file);
+        f << "x";
+    }
+    EXPECT_FALSE(utils::createDirectories(file.string()));
+
+    std::filesystem::remove_all(base);
+}
+
+// Test sanitizeFileName
+TEST(UtilsTest, SanitizeFileName) {
+    EXPECT_EQ(utils::sanitizeFileName("hello.txt"), "hello.txt");
+    // Separators are replaced
+    EXPECT_EQ(utils::sanitizeFileName("a/b\\c"), "a_b_c");
+    // Control characters are replaced
+    EXPECT_EQ(utils::sanitizeFileName(std::string("a\nb")), "a_b");
+    // NUL is replaced
+    EXPECT_EQ(utils::sanitizeFileName(std::string("a\0b", 3)), "a_b");
+}
+
+// Test sanitizePath
+TEST(UtilsTest, SanitizePath) {
+    EXPECT_EQ(utils::sanitizePath("dir/file.txt"), "dir/file.txt");
+    // Traversal components are dropped
+    EXPECT_EQ(utils::sanitizePath("../evil.txt"), "evil.txt");
+    EXPECT_EQ(utils::sanitizePath("a/../../b"), "a/b");
+    // Absolute paths are neutralized
+    EXPECT_EQ(utils::sanitizePath("/etc/passwd"), "etc/passwd");
+    EXPECT_EQ(utils::sanitizePath("/../etc/passwd"), "etc/passwd");
+    // Empty result falls back to "_"
+    EXPECT_EQ(utils::sanitizePath(".."), "_");
+    EXPECT_EQ(utils::sanitizePath(""), "_");
+    // Separators inside a component are replaced
+    EXPECT_EQ(utils::sanitizePath("a\\b"), "a_b");
+}

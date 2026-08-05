@@ -39,6 +39,15 @@ std::string formatTime(int64_t seconds);
 // Create directory if not exists
 bool createDirectory(std::string_view path);
 
+// Recursively create directories (like mkdir -p)
+bool createDirectories(std::string_view path);
+
+// Sanitize a single file/directory name (no separators, no traversal, printable only)
+std::string sanitizeFileName(std::string_view name);
+
+// Sanitize a relative path (may contain '/'), rejecting '..', absolute and empty components
+std::string sanitizePath(std::string_view path);
+
 // Get file size
 int64_t getFileSize(std::string_view path);
 
