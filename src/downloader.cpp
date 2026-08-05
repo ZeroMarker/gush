@@ -15,8 +15,10 @@
 #include <set>
 #include <sstream>
 
-Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath)
+Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath,
+                       const DownloadOptions& options)
     : torrent_(torrent), savePath_(savePath), peerId_(torrent.peerId),
+      options_(options), trackerManager_(torrent.announceList),
       lastSpeedUpdateTime_(std::chrono::steady_clock::now()) {
 
     piecesCompleted_.resize(torrent.numPieces(), false);
@@ -39,14 +41,14 @@ void Downloader::start() {
 
     // Create the save directory if it does not exist yet
     if (!utils::createDirectories(savePath_)) {
-        std::cerr << "Failed to create output directory: " << savePath_ << std::endl;
+        utils::logError("Failed to create output directory: " + savePath_);
         running_ = false;
         return;
     }
 
     // Open output file(s): single file or one per FileEntry
     if (!openOutputFiles()) {
-        std::cerr << "Failed to create output files under: " << savePath_ << std::endl;
+        utils::logError("Failed to create output files under: " + savePath_);
         closeOutputFiles();
         running_ = false;
         return;
@@ -156,48 +158,31 @@ void Downloader::stop() {
 void Downloader::downloadLoop() {
     auto lastTime = std::chrono::steady_clock::now();
     auto lastTrackerFetch = std::chrono::steady_clock::now();
+    auto lastPrune = std::chrono::steady_clock::now();
     const int TRACKER_FETCH_INTERVAL = 300;  // Fetch new trackers every 5 minutes
+    const int PRUNE_INTERVAL = 10;           // Peer health check every 10 seconds
 
     // Fetch latest trackers from online sources
-    fetchLatestTrackers();
-
-    // Contact tracker initially
-    std::cout << "Contacting tracker..." << std::endl;
-    
-    // Try first tracker, if fails try others
-    TrackerResponse trackerResp;
-    std::string trackerUrl;
-    
-    for (const auto& url : torrent_.announceList) {
-        trackerUrl = url;
-        trackerResp = contactTracker(
-            trackerUrl,
-            torrent_,
-            peerId_,
-            downloadedBytes_,
-            uploadedBytes_,
-            torrent_.totalLength() - downloadedBytes_,
-            "started"
-        );
-        
-        if (trackerResp.ok()) {
-            std::cout << "Connected to tracker: " << trackerUrl << std::endl;
-            break;
-        }
+    if (options_.refreshTrackers) {
+        fetchLatestTrackers();
     }
 
+    // Contact tracker initially
+    utils::logInfo("Contacting tracker...");
+    TrackerResponse trackerResp = trackerManager_.contact(
+        torrent_, peerId_, downloadedBytes_, uploadedBytes_,
+        torrent_.totalLength() - downloadedBytes_, "started", 3);
+
     if (trackerResp.ok()) {
-        std::cout << "Tracker response: " << trackerResp.peers.size() << " peers, "
-                  << trackerResp.complete << " seeders, " << trackerResp.incomplete << " leechers" << std::endl;
+        utils::logInfo("Tracker response: " + std::to_string(trackerResp.peers.size()) +
+                       " peers, " + std::to_string(trackerResp.complete) +
+                       " seeders, " + std::to_string(trackerResp.incomplete) + " leechers");
         addPeers(trackerResp.peers);
     } else {
-        std::cerr << "Tracker error: " << trackerResp.failure << std::endl;
+        utils::logWarn("Tracker error: " + trackerResp.failure);
     }
 
     int idleCounter = 0;
-    const int MAX_IDLE_CYCLES = 60;  // Increased to allow more time for peer response
-    int trackerRetryCounter = 0;
-    const int TRACKER_RETRY_INTERVAL = 30;  // Retry tracker every 30 seconds on failure
 
     while (running_ && !stopRequested_) {
         // Connect to peers
@@ -215,13 +200,30 @@ void Downloader::downloadLoop() {
         // Update speed stats
         updateSpeedStats();
 
+        // Endgame mode: once few blocks remain, allow duplicate requests so
+        // the slowest peer cannot stall the final stretch (BEP 3 endgame)
+        {
+            int remainingBlocks = 0;
+            for (std::size_t i = 0; i < torrent_.numPieces(); i++) {
+                if (piecesCompleted_[i]) continue;
+                remainingBlocks += pieceStates_[i].totalBlocks - pieceStates_[i].receivedBlocks;
+            }
+            endgame_ = remainingBlocks <= ENDGAME_BLOCK_THRESHOLD;
+        }
+
+        // Periodically evict unhealthy peers
+        auto nowPrune = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(nowPrune - lastPrune).count() >= PRUNE_INTERVAL) {
+            pruneBadPeers();
+            lastPrune = nowPrune;
+        }
+
         // Check if complete
         if (isComplete()) {
-            std::cout << "Download complete!" << std::endl;
+            utils::logInfo("Download complete!");
             break;
         }
 
-        // Re-contact tracker if needed or if we have too few peers
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count();
         auto elapsedSinceFetch = std::chrono::duration_cast<std::chrono::seconds>(now - lastTrackerFetch).count();
@@ -232,66 +234,32 @@ void Downloader::downloadLoop() {
         }
 
         // Fetch new trackers periodically
-        if (elapsedSinceFetch >= TRACKER_FETCH_INTERVAL) {
-            std::cout << "Refreshing tracker list..." << std::endl;
+        if (options_.refreshTrackers && elapsedSinceFetch >= TRACKER_FETCH_INTERVAL) {
+            utils::logInfo("Refreshing tracker list...");
             fetchLatestTrackers();
             lastTrackerFetch = now;
         }
 
         // Re-contact tracker if interval elapsed or we need more peers
         bool needMorePeers = activePeerCount < 10;
-        if ((trackerResp.ok() && elapsed >= trackerResp.interval) ||
-            (needMorePeers && elapsed >= TRACKER_RETRY_INTERVAL)) {
-            // Try each tracker in the list until one succeeds
-            bool trackerSuccess = false;
-            for (const auto& url : torrent_.announceList) {
-                trackerResp = contactTracker(
-                    url,
-                    torrent_,
-                    peerId_,
-                    downloadedBytes_,
-                    uploadedBytes_,
-                    torrent_.totalLength() - downloadedBytes_
-                );
-                if (trackerResp.ok()) {
-                    std::cout << "Tracker update: " << trackerResp.peers.size() << " new peers" << std::endl;
-                    addPeers(trackerResp.peers);
-                    trackerRetryCounter = 0;
-                    trackerSuccess = true;
-                    break;
-                }
-            }
-            if (!trackerSuccess) {
-                trackerRetryCounter++;
-                std::cerr << "All trackers failed, retrying later..." << std::endl;
+        bool trackerDue = (elapsed >= trackerResp.interval && trackerResp.ok()) ||
+                          (needMorePeers && elapsed >= 30) || idleCounter >= 10;
+        if (trackerDue) {
+            trackerResp = trackerManager_.contact(
+                torrent_, peerId_, downloadedBytes_, uploadedBytes_,
+                torrent_.totalLength() - downloadedBytes_, "", 3);
+            if (trackerResp.ok()) {
+                utils::logInfo("Tracker update: " + std::to_string(trackerResp.peers.size()) + " new peers");
+                addPeers(trackerResp.peers);
             }
             lastTime = now;
             idleCounter = 0;
         }
 
-        // Check for idle state (no progress)
+        // Check for idle state (no progress) - if tracker re-contact above did not
+        // help, keep trying through the manager's backoff schedule
         if (downloadedBytes_ == lastDownloadedBytes_) {
             idleCounter++;
-            if (idleCounter > MAX_IDLE_CYCLES) {
-                // Try to get more peers
-                std::cout << "Download idle, requesting more peers..." << std::endl;
-                // Try all trackers
-                for (const auto& url : torrent_.announceList) {
-                    trackerResp = contactTracker(
-                        url,
-                        torrent_,
-                        peerId_,
-                        downloadedBytes_,
-                        uploadedBytes_,
-                        torrent_.totalLength() - downloadedBytes_
-                    );
-                    if (trackerResp.ok()) {
-                        addPeers(trackerResp.peers);
-                        break;
-                    }
-                }
-                idleCounter = 0;
-            }
         } else {
             idleCounter = 0;
         }
@@ -300,18 +268,11 @@ void Downloader::downloadLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));  // Increased from 20ms to reduce CPU usage
     }
 
-    // Send stopped event to tracker
+    // Send stopped event to tracker (best effort, no backoff)
     if (!torrent_.announceList.empty()) {
         for (const auto& url : torrent_.announceList) {
-            contactTracker(
-                url,
-                torrent_,
-                peerId_,
-                downloadedBytes_,
-                uploadedBytes_,
-                torrent_.totalLength() - downloadedBytes_,
-                "stopped"
-            );
+            contactTracker(url, torrent_, peerId_, downloadedBytes_, uploadedBytes_,
+                           torrent_.totalLength() - downloadedBytes_, "stopped");
         }
     }
 
@@ -320,7 +281,7 @@ void Downloader::downloadLoop() {
 
 bool Downloader::connectToPeers() {
     // Limit concurrent connections - reduced for better stability
-    const int maxPeers = 30;  // Reduced max peers to avoid connection overload
+    const int maxPeers = options_.maxPeers;
     const int minPeers = 5;   // Reduced minimum active connections
 
     int connectedCount = 0;
@@ -345,11 +306,23 @@ bool Downloader::connectToPeers() {
         if (!peer || peer->isConnected()) continue;
         if (connectedCount >= maxPeers) break;
 
+        // Skip peers we recently rejected (avoid hot reconnection loops)
+        if (isPeerRejected(peer->ip(), peer->port())) {
+            continue;
+        }
+
         if (peer->connect()) {
             connectedCount++;
             // Send optimistic unchoke to new peer (BEP 3)
             // This tells the peer we're willing to send data (if we had any)
             peer->sendUnchoke();
+            // Start tracking connection time for health checks
+            peerSpeedStats_[peer.get()].connectedAt = std::chrono::steady_clock::now();
+            peerSpeedStats_[peer.get()].lastUpdateTime = std::chrono::steady_clock::now();
+            utils::logDebug("Connected to peer " + peer->ip() + ":" + std::to_string(peer->port()));
+        } else {
+            // Peer failed to connect - cool down briefly
+            rejectPeer(peer->ip(), peer->port());
         }
     }
     return connectedCount >= minPeers;
@@ -384,9 +357,10 @@ void Downloader::requestPieces() {
             return speedA > speedB;
         });
 
+    const int maxRequestsPerPeer = options_.maxRequestsPerPeer;
     for (auto* peer : sortedPeers) {
         // Skip if this peer already has too many pending requests
-        if (requestsPerPeer[peer] >= MAX_REQUESTS_PER_PEER) continue;
+        if (requestsPerPeer[peer] >= maxRequestsPerPeer) continue;
         requestBlocksFromPeer(peer);
     }
 }
@@ -395,6 +369,7 @@ void Downloader::requestBlocksFromPeer(PeerConnection* peer) {
     if (!peer || !peer->isConnected() || peer->peerChoking()) return;
 
     const uint32_t blockSize = 16384;  // 16 KB
+    const int maxRequestsPerPeer = options_.maxRequestsPerPeer;
 
     // Count current requests for this peer
     int currentRequests = 0;
@@ -402,7 +377,7 @@ void Downloader::requestBlocksFromPeer(PeerConnection* peer) {
         if (req.peer == peer) currentRequests++;
     }
 
-    if (currentRequests >= MAX_REQUESTS_PER_PEER) return;
+    if (currentRequests >= maxRequestsPerPeer) return;
 
     // Find pieces this peer has that we need
     std::vector<uint32_t> neededPieces;
@@ -438,8 +413,26 @@ void Downloader::requestBlocksFromPeer(PeerConnection* peer) {
     int64_t pieceEnd = std::min(pieceStart + torrent_.pieceLength, torrent_.totalLength());
     int64_t pieceSize = pieceEnd - pieceStart;
 
-    for (int i = 0; i < state.totalBlocks && currentRequests < MAX_REQUESTS_PER_PEER; i++) {
-        if (state.blocksRequested[i] || state.blocksReceived[i]) continue;
+    for (int i = 0; i < state.totalBlocks && currentRequests < maxRequestsPerPeer; i++) {
+        if (state.blocksReceived[i]) continue;
+
+        if (state.blocksRequested[i]) {
+            // Block is in flight somewhere.
+            bool requestedFromPeer = false;
+            int dupCount = 0;
+            for (const auto& req : pendingRequests_) {
+                if (req.pieceIndex == selectedPiece && req.offset == i * blockSize) {
+                    if (req.peer == peer) {
+                        requestedFromPeer = true;
+                        break;
+                    }
+                    dupCount++;
+                }
+            }
+            if (!endgame_) continue;        // Normal mode: never duplicate
+            if (requestedFromPeer) continue; // Endgame: never twice from same peer
+            if (dupCount >= 2) continue;    // Endgame: cap duplicates per block
+        }
 
         uint32_t offset = i * blockSize;
         uint32_t blockLen = std::min(static_cast<int64_t>(blockSize), pieceSize - offset);
@@ -627,12 +620,13 @@ void Downloader::processPeerMessages() {
                                     piecesCompleted_[pieceIndex] = true;
                                     piecesCompletedCount_++;
                                 }
-                                std::cout << "Piece " << pieceIndex << " complete ("
-                                          << piecesCompletedCount_ << "/" << torrent_.numPieces() << ")" << std::endl;
+                                utils::logDebug("Piece " + std::to_string(pieceIndex) + " complete (" +
+                                                std::to_string(piecesCompletedCount_) + "/" +
+                                                std::to_string(torrent_.numPieces()) + ")");
                             } else {
                                 // SHA1 mismatch: reset the piece so it gets re-requested
-                                std::cerr << "Piece " << pieceIndex
-                                          << " failed hash check, re-requesting" << std::endl;
+                                utils::logWarn("Piece " + std::to_string(pieceIndex) +
+                                               " failed hash check, re-requesting");
                                 state.blocksRequested.assign(state.totalBlocks, false);
                                 state.blocksReceived.assign(state.totalBlocks, false);
                                 state.receivedBlocks = 0;
@@ -645,7 +639,10 @@ void Downloader::processPeerMessages() {
                             }
                         }
 
+                        // Remove the fulfilled request, then cancel endgame
+                        // duplicates of the same block from other peers
                         pendingRequests_.erase(it);
+                        cancelDuplicateRequests(pieceIndex, offset, peer);
                     }
                     break;
                 }
@@ -697,6 +694,78 @@ void Downloader::cancelRequestsForPeer(PeerConnection* peer) {
             ++it;
         }
     }
+}
+
+void Downloader::cancelDuplicateRequests(uint32_t pieceIndex, uint32_t offset,
+                                         PeerConnection* keep) {
+    // Endgame mode may have the same block pending from several peers; once one
+    // copy arrives, tell the others to stop and drop their pending entries.
+    for (auto it = pendingRequests_.begin(); it != pendingRequests_.end(); ) {
+        if (it->pieceIndex == pieceIndex && it->offset == offset && it->peer != keep) {
+            it->peer->sendCancel(pieceIndex, offset, it->length);
+
+            PieceState& state = pieceStates_[pieceIndex];
+            int blockIndex = offset / 16384;
+            if (blockIndex < state.totalBlocks) {
+                state.blocksRequested[blockIndex] = false;
+            }
+            it = pendingRequests_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Downloader::pruneBadPeers() {
+    const auto now = std::chrono::steady_clock::now();
+
+    for (auto& peerPtr : peers_) {
+        if (!peerPtr || !peerPtr->isConnected()) continue;
+
+        PeerConnection* peer = peerPtr.get();
+        const PeerSpeedStats& stats = peerSpeedStats_[peer];
+
+        bool bad = false;
+        // Peer that only ever fails requests (bad data, protocol abuse)
+        if (stats.failedRequests >= 5 && stats.successfulRequests == 0) {
+            bad = true;
+        }
+        // Peer connected for over a minute that never delivered anything
+        if (!bad && stats.successfulRequests == 0) {
+            auto connectedSecs = std::chrono::duration_cast<std::chrono::seconds>(
+                now - stats.connectedAt).count();
+            if (stats.connectedAt.time_since_epoch().count() > 0 && connectedSecs > 60) {
+                bad = true;
+            }
+        }
+
+        if (bad) {
+            utils::logDebug("Evicting unproductive peer " + peer->ip() + ":" +
+                            std::to_string(peer->port()));
+            peer->disconnect();
+            rejectPeer(peer->ip(), peer->port());
+        }
+    }
+}
+
+bool Downloader::isPeerRejected(const std::string& ip, uint16_t port) const {
+    const auto now = std::chrono::steady_clock::now();
+    const std::string key = ip + ":" + std::to_string(port);
+
+    auto it = recentlyRejected_.find(key);
+    if (it == recentlyRejected_.end()) return false;
+
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count()
+        > REJECT_COOLDOWN_SECONDS) {
+        recentlyRejected_.erase(key);
+        return false;
+    }
+    return true;
+}
+
+void Downloader::rejectPeer(const std::string& ip, uint16_t port) {
+    const std::string key = ip + ":" + std::to_string(port);
+    recentlyRejected_[key] = std::chrono::steady_clock::now();
 }
 
 void Downloader::updateSpeedStats() {
@@ -819,8 +888,12 @@ bool Downloader::isComplete() const {
 
 double Downloader::getProgress() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (torrent_.numPieces() == 0) return 0.0;
-    return static_cast<double>(piecesCompletedCount_) / torrent_.numPieces();
+    // Progress is byte-based: the last piece may be smaller than pieceLength,
+    // so counting completed pieces under- or over-reports the real progress
+    // (todo P0: "修复下载完成统计口径").
+    const int64_t total = torrent_.totalLength();
+    if (total <= 0) return 0.0;
+    return std::min(1.0, static_cast<double>(downloadedBytes_) / total);
 }
 
 DownloadStats Downloader::getStats() const {
@@ -831,8 +904,7 @@ DownloadStats Downloader::getStats() const {
     stats.totalLength = torrent_.totalLength();
     stats.downloadSpeed = currentSpeed_;
     stats.currentSpeed = currentSpeed_;
-    stats.progress = static_cast<double>(piecesCompletedCount_) /
-                     (torrent_.numPieces() > 0 ? torrent_.numPieces() : 1);
+    stats.progress = getProgress();
     stats.connectedPeers = static_cast<int>(peers_.size());
     stats.activePeers = 0;
 
@@ -848,6 +920,9 @@ DownloadStats Downloader::getStats() const {
 void Downloader::addPeers(const std::vector<Peer>& peers) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& peer : peers) {
+        // Skip peers we recently rejected for misbehaviour
+        if (isPeerRejected(peer.ip, peer.port)) continue;
+
         // Check if already connected
         bool exists = false;
         for (const auto& existing : peers_) {
@@ -866,7 +941,7 @@ void Downloader::addPeers(const std::vector<Peer>& peers) {
 }
 
 void Downloader::fetchLatestTrackers() {
-    std::cout << "Fetching latest tracker list from online sources..." << std::endl;
+    utils::logInfo("Fetching latest tracker list from online sources...");
     
     std::vector<std::string> newTrackers = TrackerList::fetchTrackersFromMultipleSources({
         TrackerList::Source::TRACKERSLIST_ALL,
@@ -874,11 +949,11 @@ void Downloader::fetchLatestTrackers() {
     });
     
     if (newTrackers.empty()) {
-        std::cerr << "Warning: Failed to fetch online tracker list" << std::endl;
+        utils::logWarn("Failed to fetch online tracker list");
         return;
     }
     
-    std::cout << "Fetched " << newTrackers.size() << " trackers" << std::endl;
+    utils::logDebug("Fetched " + std::to_string(newTrackers.size()) + " trackers");
     
     // Merge with existing announce list, avoiding duplicates
     std::set<std::string> existingTrackers(torrent_.announceList.begin(), torrent_.announceList.end());
@@ -886,9 +961,10 @@ void Downloader::fetchLatestTrackers() {
     for (const auto& tracker : newTrackers) {
         if (existingTrackers.find(tracker) == existingTrackers.end()) {
             torrent_.announceList.push_back(tracker);
+            trackerManager_.add(tracker);
             existingTrackers.insert(tracker);
         }
     }
     
-    std::cout << "Total trackers available: " << torrent_.announceList.size() << std::endl;
+    utils::logDebug("Total trackers available: " + std::to_string(torrent_.announceList.size()));
 }

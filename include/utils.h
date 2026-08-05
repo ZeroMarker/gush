@@ -8,6 +8,19 @@
 
 namespace utils {
 
+// ---- Simple leveled logging (thread-safe) --------------------------------
+// Consolidates scattered std::cout/std::cerr calls. Default level: Info.
+enum class LogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3 };
+
+void setLogLevel(LogLevel level);
+LogLevel logLevel();
+void log(LogLevel level, std::string_view message);
+
+inline void logError(std::string_view m) { log(LogLevel::Error, m); }
+inline void logWarn(std::string_view m) { log(LogLevel::Warn, m); }
+inline void logInfo(std::string_view m) { log(LogLevel::Info, m); }
+inline void logDebug(std::string_view m) { log(LogLevel::Debug, m); }
+
 // SHA1 hash
 std::string sha1(std::string_view data);
 std::string sha1(const uint8_t* data, size_t len);

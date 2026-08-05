@@ -3,6 +3,7 @@
 
 #include "torrent.h"
 #include "peer.h"
+#include "tracker_manager.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -13,6 +14,14 @@
 #include <cstdio>
 #include <map>
 #include <thread>
+
+// Tunable download behaviour (set from CLI options, todo P3)
+struct DownloadOptions {
+    int maxPeers = 30;              // hard cap on concurrent peer connections
+    int maxRequestsPerPeer = 5;     // pipelined block requests per peer
+    bool refreshTrackers = true;    // fetch fresh tracker lists from the internet
+    bool verbose = false;
+};
 
 struct DownloadStats {
     int64_t downloaded;
@@ -49,7 +58,8 @@ struct PieceState {
 
 class Downloader {
 public:
-    Downloader(const TorrentInfo& torrent, const std::string& savePath);
+    Downloader(const TorrentInfo& torrent, const std::string& savePath,
+               const DownloadOptions& options = DownloadOptions());
     ~Downloader();
 
     // Start download
@@ -95,6 +105,10 @@ private:
     int64_t pieceSize(uint32_t pieceIndex) const;
     void cleanupTimedOutRequests();
     void cancelRequestsForPeer(PeerConnection* peer);
+    void cancelDuplicateRequests(uint32_t pieceIndex, uint32_t offset, PeerConnection* keep);
+    void pruneBadPeers();
+    bool isPeerRejected(const std::string& ip, uint16_t port) const;
+    void rejectPeer(const std::string& ip, uint16_t port);
 
     // Output file management (single- and multi-file torrents)
     struct OutputFile {
@@ -110,6 +124,8 @@ private:
     TorrentInfo torrent_;
     std::string savePath_;
     std::string peerId_;
+    DownloadOptions options_;
+    TrackerManager trackerManager_;
 
     std::vector<std::unique_ptr<PeerConnection>> peers_;
     std::vector<bool> piecesCompleted_;
@@ -132,12 +148,12 @@ private:
     std::vector<BlockRequest> pendingRequests_;
     static const int MAX_PENDING_REQUESTS = 100;  // Reduced to prevent overwhelming peers
     static const int REQUEST_TIMEOUT_MS = 15000;  // Increased timeout for slower peers
-    static const int MAX_REQUESTS_PER_PEER = 5;   // Reduced to avoid flooding peers
 
     // Peer speed tracking for peer scoring
     struct PeerSpeedStats {
         int64_t bytesDownloaded = 0;
         std::chrono::steady_clock::time_point lastUpdateTime;
+        std::chrono::steady_clock::time_point connectedAt;
         double avgSpeed = 0.0;  // bytes/sec
         int successfulRequests = 0;
         int failedRequests = 0;
@@ -154,6 +170,14 @@ private:
         }
     };
     std::map<PeerConnection*, PeerSpeedStats> peerSpeedStats_;
+
+    // Recently rejected peers (ip:port) so we do not hot-reconnect bad peers
+    mutable std::map<std::string, std::chrono::steady_clock::time_point> recentlyRejected_;
+    static constexpr int REJECT_COOLDOWN_SECONDS = 300;
+
+    // Endgame mode: near completion, duplicate block requests are allowed
+    bool endgame_ = false;
+    static constexpr int ENDGAME_BLOCK_THRESHOLD = 64;
 
     // Output file handles (single- or multi-file)
     std::vector<OutputFile> outputFiles_;

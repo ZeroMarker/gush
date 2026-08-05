@@ -2,21 +2,18 @@
 
 ## P0 - 稳定性与数据正确性
 
-- [ ] 修复多文件下载写入逻辑
-  - 当前下载器按 `torrent_.name` 写单个输出文件，和 README 中的多文件解析能力不匹配。
-  - 需要按 `TorrentInfo::files` 创建目录和文件，并把 piece/block 偏移映射到一个或多个目标文件。
+- [x] 修复多文件下载写入逻辑
+  - 下载器按 `TorrentInfo::files` 创建目录和文件，block 偏移映射到一个或多个目标文件。
 
-- [ ] 增加 piece SHA1 校验
-  - 当前 `verifyPiece()` 已声明但下载完成路径没有做完整校验。
-  - 每个 piece 写入完成前应按 `.torrent` 中的 20 字节哈希校验，失败时重置该 piece 的请求/接收状态。
+- [x] 增加 piece SHA1 校验
+  - 每个 piece 写入完成前按 `.torrent` 中的 20 字节哈希校验，失败时重置该 piece 的请求/接收状态。
 
-- [ ] 修复下载完成统计口径
-  - 当前按完成 piece 数计算进度，最后一个 piece 可能小于标准 piece length。
-  - 进度和 downloaded bytes 应以实际文件总长度为准，避免显示超过或低估。
+- [x] 修复下载完成统计口径
+  - 进度与 downloaded bytes 以实际文件总长度为准（`downloadedBytes_ / totalLength`），
+    不再按 piece 数估算，最后一个短 piece 不会导致显示偏差。
 
-- [ ] 收紧输出路径安全
-  - 清理 torrent 文件名和多文件路径中的 `..`、绝对路径、空路径和平台危险字符。
-  - 避免恶意 torrent 写出保存目录。
+- [x] 收紧输出路径安全
+  - `sanitizePath`/`sanitizeFileName` 过滤 `..`、绝对路径、空路径与平台危险字符。
 
 ## P1 - 网络协议与下载效率
 
@@ -27,17 +24,18 @@
 - [ ] 实现 PEX 支持
   - 支持从已连接 peer 获取更多 peer，减少对 tracker 的依赖。
 
-- [ ] 改进 tracker 策略
-  - 给 tracker 加失败退避、成功优先级和并发联系上限。
-  - 避免每次空闲时线性扫全部 tracker。
+- [x] 改进 tracker 策略
+  - `TrackerManager`：指数退避（30s 起，上限 30min）、成功优先级（上次成功的 tracker 优先）、
+    每周期尝试上限（默认 3 次），避免死 tracker 拖慢下载循环。
 
-- [ ] 优化 piece selection
-  - 现有 rarest-first 比较基础。
-  - 增加 endgame mode，下载末尾允许重复请求慢块并及时 cancel。
+- [x] 优化 piece selection
+  - rarest-first + partial completion 优先级保持不变；
+  - 增加 endgame mode：剩余 block 数 <= 64 时允许重复请求（每个 block 最多 2 份），
+    收到任一副本后向其他 peer 发送 cancel 并清理 pending 请求。
 
-- [ ] 增加 peer 健康管理
-  - 按超时、坏块、choke 时间和吞吐量淘汰低质量 peer。
-  - 限制重复连接和连接失败重试频率。
+- [x] 增加 peer 健康管理
+  - 定期淘汰坏 peer（失败请求 >= 5 且无成功、或连接 > 60s 无数据）；
+  - 被淘汰/连接失败的 peer 进入 5 分钟冷却名单，避免热重连。
 
 ## P2 - 测试覆盖
 
@@ -54,37 +52,38 @@
 - [ ] 增加 metadata downloader 测试
   - 覆盖 BEP 9 extension handshake、metadata 分片拼接、hash mismatch 和 peer reject。
 
-- [ ] 增加 sanitizer CI
-  - Debug CI 跑 ASan/UBSan。
-  - 网络相关测试先保持本地 deterministic，不依赖公网 tracker。
+- [x] 增加 TrackerManager 单元测试
+  - 覆盖退避、成功复位、优先级排序、去重和超时恢复。
+
+- [x] 增加 sanitizer CI
+  - `.github/workflows/ci.yml`：Release 构建 + ASan/UBSan Debug 构建，均跑 `ctest`。
 
 ## P3 - 工程化与用户体验
 
-- [ ] 增加 `.gitignore`
+- [x] 增加 `.gitignore`
   - 忽略 `build/`、编译产物、临时下载文件和编辑器缓存。
 
-- [ ] 增加 CLI 参数
+- [x] 增加 CLI 参数
   - `--no-tracker-refresh`
-  - `--max-peers`
-  - `--download-dir`
-  - `--verbose`
+  - `--max-peers <n>`
+  - `-o/--download-dir <dir>`
+  - `-v/--verbose`
+  - `-h/--help`
 
-- [ ] 引入日志级别
-  - 将散落的 `std::cout`/`std::cerr` 收口到简单 logger。
-  - 默认输出保持简洁，debug 模式输出 tracker/peer 细节。
+- [x] 引入日志级别
+  - `utils::log`（Error/Warn/Info/Debug），默认 Info，`--verbose` 打开 Debug；
+  - downloader/tracker_list/metadata 的散落输出已收口。
 
-- [ ] 优化 README
-  - 明确当前真实能力和限制。
-  - 增加构建依赖安装示例、测试命令和已知问题。
+- [x] 优化 README
+  - 明确当前真实能力和限制，增加 CLI 选项表、测试命令和项目结构。
 
-- [ ] 增加 GitHub Actions
-  - Linux Debug/Release 构建。
-  - 运行 `ctest --output-on-failure`。
+- [x] 增加 GitHub Actions
+  - Linux Debug/Release 构建 + 运行 `ctest --output-on-failure` + ASan/UBSan。
 
 ## 推荐执行顺序
 
-1. 添加 `.gitignore` 和 CI，固定基础工程质量门槛。
-2. 完成 piece SHA1 校验，防止错误数据落盘。
-3. 修复单文件/多文件写入抽象，并恢复多文件测试。
-4. 增加 Downloader/PeerConnection 本地协议测试。
-5. 再推进 DHT、PEX、endgame mode 等协议能力。
+1. ~~添加 `.gitignore` 和 CI，固定基础工程质量门槛。~~
+2. ~~完成 piece SHA1 校验，防止错误数据落盘。~~
+3. ~~修复单文件/多文件写入抽象，并恢复多文件测试。~~
+4. ~~增加 Downloader/PeerConnection 本地协议测试。~~（Downloader/Peer 测试仍待补）
+5. 再推进 DHT、PEX、endgame mode 等协议能力。（endgame 已完成，DHT/PEX 待做）

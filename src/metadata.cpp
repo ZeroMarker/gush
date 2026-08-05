@@ -148,7 +148,7 @@ MetadataDownloader::MetadataDownloader(const MagnetLink& magnet)
 
 // Fetch built-in tracker list from online sources
 static std::vector<std::string> getBuiltinTrackers() {
-    std::cout << "Fetching latest tracker list from online sources..." << std::endl;
+    utils::logInfo("Fetching latest tracker list from online sources...");
 
     // Fetch from multiple sources
     std::vector<std::string> trackers = TrackerList::fetchTrackersFromMultipleSources({
@@ -158,7 +158,7 @@ static std::vector<std::string> getBuiltinTrackers() {
 
     // If fetching failed, fall back to hardcoded list
     if (trackers.empty()) {
-        std::cerr << "Warning: Failed to fetch online tracker list, using fallback list" << std::endl;
+        utils::logWarn("Failed to fetch online tracker list, using fallback list");
         return {
             "udp://tracker.opentrackr.org:1337/announce",
             "udp://open.tracker.cl:1337/announce",
@@ -182,7 +182,7 @@ static std::vector<std::string> getBuiltinTrackers() {
         };
     }
 
-    std::cout << "Loaded " << trackers.size() << " trackers from online sources" << std::endl;
+    utils::logDebug("Loaded " + std::to_string(trackers.size()) + " trackers from online sources");
     return trackers;
 }
 
@@ -191,7 +191,7 @@ bool MetadataDownloader::start() {
     std::vector<std::string> trackersToUse = magnet_.trackers;
 
     if (trackersToUse.empty()) {
-        std::cout << "No trackers in magnet link, fetching latest tracker list" << std::endl;
+        utils::logInfo("No trackers in magnet link, fetching latest tracker list");
         trackersToUse = getBuiltinTrackers();
     }
 
@@ -211,14 +211,14 @@ bool MetadataDownloader::start() {
     const size_t MAX_PEERS = 50;
     for (size_t i = 0; i < trackersToUse.size() && i < MAX_TRACKERS_TO_TRY; ++i) {
         const std::string& trackerUrl = trackersToUse[i];
-        std::cout << "Contacting tracker: " << trackerUrl << std::endl;
+        utils::logDebug("Contacting tracker: " + trackerUrl);
         TrackerResponse response = contactTracker(trackerUrl, tempTorrent, tempTorrent.peerId);
 
         if (response.ok()) {
-            std::cout << "  Got " << response.peers.size() << " peers from tracker" << std::endl;
+            utils::logDebug("  Got " + std::to_string(response.peers.size()) + " peers from tracker");
             allPeers.insert(allPeers.end(), response.peers.begin(), response.peers.end());
         } else {
-            std::cout << "  Tracker failed: " << response.failure << std::endl;
+            utils::logDebug("  Tracker failed: " + response.failure);
         }
 
         // Stop if we have enough peers
@@ -226,24 +226,24 @@ bool MetadataDownloader::start() {
     }
 
     if (allPeers.empty()) {
-        std::cerr << "No peers available from any tracker" << std::endl;
-        std::cerr << "Note: Pure hash magnet links may need DHT for peer discovery" << std::endl;
+        utils::logError("No peers available from any tracker");
+        utils::logError("Note: Pure hash magnet links may need DHT for peer discovery");
         return false;
     }
 
-    std::cout << "Total peers available: " << allPeers.size() << std::endl;
+    utils::logInfo("Total peers available: " + std::to_string(allPeers.size()));
 
     // Try to download metadata from each peer
     for (const auto& peer : allPeers) {
-        std::cout << "Trying peer: " << peer.ip << ":" << peer.port << std::endl;
+        utils::logDebug("Trying peer: " + peer.ip + ":" + std::to_string(peer.port));
         if (downloadFromPeer(peer.ip, peer.port)) {
-            std::cout << "Successfully downloaded metadata from peer" << std::endl;
+            utils::logDebug("Successfully downloaded metadata from peer");
             if (complete_) break;
         }
     }
 
     if (!complete_) {
-        std::cerr << "Failed to download complete metadata from all peers" << std::endl;
+        utils::logError("Failed to download complete metadata from all peers");
         return false;
     }
 
@@ -398,8 +398,8 @@ bool MetadataDownloader::exchangeExtensions(int sock, int& metadataExtId) {
                 metadataSize_ = static_cast<int>(metadataSizeVal->asInt());
                 numPieces_ = (metadataSize_ + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
                 pieces_.resize(numPieces_);
-                std::cout << "Metadata size: " << metadataSize_ << " bytes, "
-                          << numPieces_ << " pieces" << std::endl;
+                utils::logDebug("Metadata size: " + std::to_string(metadataSize_) +
+                                  " bytes, " + std::to_string(numPieces_) + " pieces");
             }
 
             // Get ut_metadata extension ID from 'm' dictionary
@@ -409,13 +409,13 @@ bool MetadataDownloader::exchangeExtensions(int sock, int& metadataExtId) {
                 const auto* utMetadata = bencode::dictGet(m, "ut_metadata");
                 if (utMetadata && utMetadata->isInt()) {
                     metadataExtId = static_cast<int>(utMetadata->asInt());
-                    std::cout << "Peer supports ut_metadata extension (ID: "
-                              << metadataExtId << ")" << std::endl;
+                    utils::logDebug("Peer supports ut_metadata extension (ID: " +
+                                       std::to_string(metadataExtId) + ")");
                 }
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "Failed to parse extended handshake: " << e.what() << std::endl;
+        utils::logWarn(std::string("Failed to parse extended handshake: ") + e.what());
         return false;
     }
 
@@ -469,7 +469,7 @@ bool MetadataDownloader::requestMetadata(int sock, int metadataExtId) {
                 msgType = static_cast<int>(msgTypeVal->asInt());
             }
         } catch (const std::exception& e) {
-            std::cerr << "Failed to parse metadata response: " << e.what() << std::endl;
+            utils::logWarn(std::string("Failed to parse metadata response: ") + e.what());
             return false;
         }
 
@@ -479,10 +479,10 @@ bool MetadataDownloader::requestMetadata(int sock, int metadataExtId) {
                 pieces_[i].assign(payload.begin() + static_cast<std::ptrdiff_t>(pos), payload.end());
             }
         } else if (msgType == 2) {  // Reject
-            std::cerr << "Peer rejected metadata request for piece " << i << std::endl;
+            utils::logWarn("Peer rejected metadata request for piece " + std::to_string(i));
             return false;
         } else {
-            std::cerr << "Unexpected metadata response type for piece " << i << std::endl;
+            utils::logWarn("Unexpected metadata response type for piece " + std::to_string(i));
             return false;
         }
     }
@@ -495,8 +495,8 @@ bool MetadataDownloader::requestMetadata(int sock, int metadataExtId) {
 
     // Verify metadata size
     if (static_cast<int>(metadata_.size()) != metadataSize_) {
-        std::cerr << "Metadata size mismatch: expected " << metadataSize_
-                  << ", got " << metadata_.size() << std::endl;
+        utils::logWarn("Metadata size mismatch: expected " + std::to_string(metadataSize_) +
+                       ", got " + std::to_string(metadata_.size()));
         metadata_.clear();
         return false;
     }
@@ -504,13 +504,13 @@ bool MetadataDownloader::requestMetadata(int sock, int metadataExtId) {
     // Verify metadata hash
     std::string hash = utils::sha1(metadata_);
     if (hash != magnet_.infoHashRaw) {
-        std::cerr << "Metadata hash mismatch" << std::endl;
+        utils::logWarn("Metadata hash mismatch");
         metadata_.clear();
         return false;
     }
 
     complete_ = true;
-    std::cout << "Metadata verified successfully, size: " << metadata_.size() << " bytes" << std::endl;
+    utils::logInfo("Metadata verified successfully, size: " + std::to_string(metadata_.size()) + " bytes");
     return true;
 }
 

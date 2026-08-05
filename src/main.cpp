@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <iomanip>
 #include <atomic>
+#include <vector>
+#include <cstdlib>
 
 static Downloader* g_downloader = nullptr;
 static std::atomic<bool> g_interrupt{false};
@@ -26,7 +28,7 @@ void signalHandler(int /*signum*/) {
 }
 
 void printUsage(const char* program) {
-    std::cout << "Usage: " << program << " <torrent_file|magnet_link> [output_directory]" << std::endl;
+    std::cout << "Usage: " << program << " [options] <torrent_file|magnet_link> [output_directory]" << std::endl;
     std::cout << std::endl;
     std::cout << "Gush - A minimal BitTorrent client" << std::endl;
     std::cout << std::endl;
@@ -35,9 +37,85 @@ void printUsage(const char* program) {
     std::cout << "  magnet_link       Magnet link (magnet:?xt=urn:btih:...)" << std::endl;
     std::cout << "  output_directory  Directory to save downloaded files (default: current directory)" << std::endl;
     std::cout << std::endl;
-    std::cout << "Example:" << std::endl;
+    std::cout << "Options:" << std::endl;
+    std::cout << "  -o, --download-dir <dir>   Directory to save downloaded files" << std::endl;
+    std::cout << "      --max-peers <n>        Maximum concurrent peer connections (default: 30)" << std::endl;
+    std::cout << "      --no-tracker-refresh   Do not fetch tracker lists from the internet" << std::endl;
+    std::cout << "  -v, --verbose              Verbose logging (tracker/peer details)" << std::endl;
+    std::cout << "  -h, --help                 Show this help" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples:" << std::endl;
     std::cout << "  " << program << " ubuntu-22.04.torrent ~/Downloads" << std::endl;
-    std::cout << "  " << program << " \"magnet:?xt=urn:btih:HASH&dn=Name\" ~/Downloads" << std::endl;
+    std::cout << "  " << program << " -o ~/Downloads --max-peers 50 \"magnet:?xt=urn:btih:HASH\"" << std::endl;
+}
+
+struct CliOptions {
+    std::string input;
+    std::string savePath = ".";
+    int maxPeers = 30;
+    bool refreshTrackers = true;
+    bool verbose = false;
+};
+
+// Parse CLI arguments, supporting both legacy positional args and new options.
+// Returns false on parse error.
+bool parseArgs(int argc, char* argv[], CliOptions& opts) {
+    std::vector<std::string> positional;
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            exit(0);
+        } else if (arg == "-o" || arg == "--download-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << arg << " requires a directory argument" << std::endl;
+                return false;
+            }
+            opts.savePath = argv[++i];
+        } else if (arg == "--max-peers") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --max-peers requires a number" << std::endl;
+                return false;
+            }
+            try {
+                opts.maxPeers = std::stoi(argv[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid --max-peers value: " << argv[i] << std::endl;
+                return false;
+            }
+            if (opts.maxPeers < 1 || opts.maxPeers > 500) {
+                std::cerr << "Error: --max-peers must be between 1 and 500" << std::endl;
+                return false;
+            }
+        } else if (arg == "--no-tracker-refresh") {
+            opts.refreshTrackers = false;
+        } else if (arg == "-v" || arg == "--verbose") {
+            opts.verbose = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Error: unknown option: " << arg << std::endl;
+            return false;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.empty()) {
+        printUsage(argv[0]);
+        return false;
+    }
+
+    opts.input = positional[0];
+    // Backward-compatible second positional argument overrides -o/--download-dir
+    if (positional.size() >= 2) {
+        opts.savePath = positional[1];
+    }
+    if (positional.size() > 2) {
+        std::cerr << "Error: too many arguments" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 void printInfo(const TorrentInfo& torrent) {
@@ -148,13 +226,16 @@ bool isMagnetLink(const std::string& input) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printUsage(argv[0]);
+    CliOptions opts;
+    if (!parseArgs(argc, argv, opts)) {
         return 1;
     }
 
-    std::string input = argv[1];
-    std::string savePath = (argc > 2) ? argv[2] : ".";
+    // Configure logging
+    utils::setLogLevel(opts.verbose ? utils::LogLevel::Debug : utils::LogLevel::Info);
+
+    std::string input = opts.input;
+    std::string savePath = opts.savePath;
 
     // Set up signal handler
     signal(SIGINT, signalHandler);
@@ -174,7 +255,7 @@ int main(int argc, char* argv[]) {
             // Parse magnet link
             MagnetLink magnet = parseMagnetLink(input);
             if (!magnet.isValid()) {
-                std::cerr << "Error: Invalid magnet link" << std::endl;
+                utils::logError("Invalid magnet link");
                 return 1;
             }
 
@@ -193,8 +274,8 @@ int main(int argc, char* argv[]) {
             std::string metadata = downloadMetadata(magnet);
 
             if (metadata.empty()) {
-                std::cerr << "Error: Failed to download metadata from peers" << std::endl;
-                std::cerr << "Note: Magnet links require DHT or peer discovery to fetch metadata." << std::endl;
+                utils::logError("Failed to download metadata from peers");
+                utils::logError("Note: Magnet links require DHT or peer discovery to fetch metadata.");
                 return 1;
             }
 
@@ -216,8 +297,14 @@ int main(int argc, char* argv[]) {
         // Create output directory if needed
         utils::createDirectory(savePath);
 
+        // Build download options from CLI
+        DownloadOptions options;
+        options.maxPeers = opts.maxPeers;
+        options.refreshTrackers = opts.refreshTrackers;
+        options.verbose = opts.verbose;
+
         // Create downloader
-        Downloader downloader(torrent, savePath);
+        Downloader downloader(torrent, savePath, options);
         g_downloader = &downloader;
 
         // Start download
@@ -242,7 +329,14 @@ int main(int argc, char* argv[]) {
                 std::cout << "\r";
                 std::cout << "Progress: " << std::fixed << std::setprecision(1)
                           << (stats.progress * 100.0) << "% ";
-                std::cout << "Downloaded: " << utils::formatBytes(stats.downloaded) << " ";
+                std::cout << "Downloaded: " << utils::formatBytes(stats.downloaded);
+                std::cout << " / " << utils::formatBytes(stats.totalLength) << " ";
+                if (stats.currentSpeed > 0) {
+                    std::cout << "Speed: " << utils::formatBytes(
+                        static_cast<int64_t>(stats.currentSpeed)) << "/s ";
+                } else {
+                    std::cout << "Speed: stalled ";
+                }
                 std::cout << "Peers: " << stats.activePeers << "/" << stats.connectedPeers;
                 std::cout.flush();
 
@@ -270,7 +364,7 @@ int main(int argc, char* argv[]) {
         return 0;
 
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        utils::logError(std::string("Error: ") + e.what());
         return 1;
     }
 }

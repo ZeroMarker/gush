@@ -1,4 +1,5 @@
 #include "tracker_list.h"
+#include "utils.h"
 #include <curl/curl.h>
 #include <sstream>
 #include <algorithm>
@@ -81,7 +82,7 @@ std::vector<std::string> fetchTrackers(Source source) {
 
     CURL* curl = curl_easy_init();
     if (!curl) {
-        std::cerr << "Failed to initialize CURL for tracker list fetch" << std::endl;
+        utils::logWarn("Failed to initialize CURL for tracker list fetch");
         return trackers;
     }
 
@@ -101,7 +102,7 @@ std::vector<std::string> fetchTrackers(Source source) {
     CURLcode res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
-        std::cerr << "Failed to fetch tracker list: " << curl_easy_strerror(res) << std::endl;
+        utils::logDebug(std::string("Failed to fetch tracker list: ") + curl_easy_strerror(res));
         curl_easy_cleanup(curl);
         return trackers;
     }
@@ -111,7 +112,7 @@ std::vector<std::string> fetchTrackers(Source source) {
     curl_easy_cleanup(curl);
 
     if (httpCode != 200) {
-        std::cerr << "HTTP error fetching tracker list: " << httpCode << std::endl;
+        utils::logDebug("HTTP error fetching tracker list: " + std::to_string(httpCode));
         return trackers;
     }
 
@@ -147,7 +148,7 @@ std::vector<std::string> fetchTrackersFromMultipleSources(
     for (Source source : sources) {
         std::vector<std::string> trackers = fetchTrackers(source);
         if (!trackers.empty()) {
-            std::cout << "Fetched " << trackers.size() << " trackers from source" << std::endl;
+            utils::logDebug("Fetched " + std::to_string(trackers.size()) + " trackers from source");
             allTrackers.insert(allTrackers.end(), trackers.begin(), trackers.end());
         }
     }

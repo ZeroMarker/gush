@@ -7,11 +7,16 @@ A minimal BitTorrent client implemented in modern C++17.
 - Parse .torrent files (bencode decoding)
 - **Magnet link support (BEP 9)** with automatic metadata download
 - **Dynamic tracker list fetching** from online sources (trackerslist.com, ngosang/trackerslist)
-- HTTP/HTTPS/UDP tracker communication
+- HTTP/HTTPS/UDP tracker communication (BEP 15)
+- **Tracker strategy**: exponential failure backoff, success priority, bounded attempts per cycle
 - Peer connection and handshake
-- BitTorrent peer wire protocol
-- Piece downloading and file assembly
-- Progress display
+- BitTorrent peer wire protocol (BEP 3)
+- Piece SHA1 verification before writing to disk
+- Rarest-first piece selection with partial-completion priority
+- **Endgame mode**: duplicate block requests near completion so slow peers cannot stall the finish
+- **Peer health management**: slow/failing peers are evicted and temporarily blacklisted
+- Single- and multi-file downloads with path-traversal-safe filenames
+- Byte-accurate progress display with live speed
 
 ## Dependencies
 
@@ -29,9 +34,19 @@ make -j$(nproc)
 
 ## Usage
 
-```bash
-./gush <torrent_file|magnet_link> [output_directory]
 ```
+gush [options] <torrent_file|magnet_link> [output_directory]
+```
+
+### Options
+
+| Option | Description |
+| ------ | ----------- |
+| `-o, --download-dir <dir>` | Directory to save downloaded files (default: current directory) |
+| `--max-peers <n>` | Maximum concurrent peer connections (default: 30, range 1-500) |
+| `--no-tracker-refresh` | Do not fetch tracker lists from the internet |
+| `-v, --verbose` | Verbose logging (tracker/peer details) |
+| `-h, --help` | Show help |
 
 ### Examples
 
@@ -42,8 +57,9 @@ make -j$(nproc)
 # Download using magnet link
 ./gush "magnet:?xt=urn:btih:HASH&dn=Name" ~/Downloads
 
-# Download with automatic tracker list refresh
-./gush "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10" ./downloads
+# With options
+./gush -o ~/Downloads --max-peers 50 "magnet:?xt=urn:btih:HASH"
+./gush --no-tracker-refresh ubuntu-22.04.torrent
 ```
 
 ### Magnet Link Support
@@ -58,29 +74,41 @@ When using magnet links, gush will:
 
 ```
 gush/
-├── CMakeLists.txt          # Build configuration
 ├── include/
 │   ├── bencode.h           # Bencode parser/encoder
 │   ├── torrent.h           # Torrent file parsing
-│   ├── tracker.h           # Tracker communication
+│   ├── tracker.h           # Tracker protocol (HTTP/HTTPS/UDP)
+│   ├── tracker_manager.h   # Tracker strategy: backoff + priority
 │   ├── peer.h              # Peer connection handling
 │   ├── downloader.h        # Main download logic
-│   └── utils.h             # Utility functions
+│   ├── metadata.h          # BEP 9 metadata download
+│   └── utils.h             # Utilities + leveled logger
 └── src/
-    ├── main.cpp            # Entry point
+    ├── main.cpp            # Entry point + CLI
     ├── bencode.cpp
     ├── torrent.cpp
     ├── tracker.cpp
+    ├── tracker_manager.cpp
     ├── peer.cpp
     ├── downloader.cpp
+    ├── metadata.cpp
     └── utils.cpp
 ```
+
+## Testing
+
+```bash
+cd build
+ctest --output-on-failure
+```
+
+Unit tests cover bencode, magnet links, torrent parsing, tracker responses,
+tracker strategy and utilities. A CI workflow (`.github/workflows/ci.yml`)
+runs the suite under Release and ASan/UBSan builds.
 
 ## Limitations (MVP)
 
 - DHT not yet implemented (relies on trackers for peer discovery)
-- Single file download optimization
-- Basic piece selection (rarest-first with partial completion priority)
 - No peer exchange (PEX)
 - No encryption support
 

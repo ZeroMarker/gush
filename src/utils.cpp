@@ -6,8 +6,38 @@
 #include <sys/stat.h>
 #include <cstring>
 #include <cerrno>
+#include <atomic>
+#include <mutex>
+#include <iostream>
 
 namespace utils {
+
+namespace {
+std::atomic<int> g_logLevel{static_cast<int>(LogLevel::Info)};
+std::mutex g_logMutex;
+}
+
+void setLogLevel(LogLevel level) {
+    g_logLevel.store(static_cast<int>(level));
+}
+
+LogLevel logLevel() {
+    return static_cast<LogLevel>(g_logLevel.load());
+}
+
+void log(LogLevel level, std::string_view message) {
+    if (static_cast<int>(level) > g_logLevel.load()) return;
+
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ostream& out = (level == LogLevel::Error) ? std::cerr : std::cout;
+    switch (level) {
+        case LogLevel::Error: out << "[error] "; break;
+        case LogLevel::Warn:  out << "[warn]  "; break;
+        case LogLevel::Debug: out << "[debug] "; break;
+        default:              break;  // Info: no prefix, keep the UI clean
+    }
+    out << message << std::endl;
+}
 
 std::string sha1(std::string_view data) {
     return sha1(reinterpret_cast<const uint8_t*>(data.data()), data.size());

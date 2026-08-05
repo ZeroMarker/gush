@@ -44,6 +44,7 @@ set(GUSH_LIB_SOURCES
     src/bencode.cpp
     src/torrent.cpp
     src/tracker.cpp
+    src/tracker_manager.cpp
     src/peer.cpp
     src/downloader.cpp
     src/utils.cpp
@@ -97,6 +98,7 @@ set(TEST_SOURCES
     tests/test_magnet.cpp
     tests/test_torrent.cpp
     tests/test_tracker.cpp
+    tests/test_tracker_manager.cpp
 )
 
 add_executable(test_gush ${TEST_SOURCES})
