@@ -1,6 +1,7 @@
 #include "downloader.h"
 #include "tracker.h"
 #include "tracker_list.h"
+#include "dht.h"
 #include "utils.h"
 #include <thread>
 #include <chrono>
@@ -184,6 +185,25 @@ void Downloader::downloadLoop() {
         addPeers(trackerResp.peers);
     } else {
         utils::logWarn("Tracker error: " + trackerResp.failure);
+    }
+
+    // Fall back to BEP 5 when neither callers nor trackers supplied a peer.
+    // This keeps pure-hash magnets usable after their metadata has been fetched.
+    bool haveKnownPeers = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        haveKnownPeers = !peers_.empty();
+    }
+    if (!haveKnownPeers) {
+        DhtOptions dhtOptions;
+        dhtOptions.queryTimeoutMs = 600;
+        dhtOptions.maxQueries = 16;
+        dhtOptions.maxPeers = static_cast<std::size_t>(options_.maxPeers) * 2;
+        auto dhtPeers = discoverDhtPeers(torrent_.infoHash, {}, dhtOptions);
+        if (!dhtPeers.empty()) {
+            utils::logInfo("DHT discovered " + std::to_string(dhtPeers.size()) + " peers");
+            addPeers(dhtPeers);
+        }
     }
 
     int idleCounter = 0;

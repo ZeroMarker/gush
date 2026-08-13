@@ -8,6 +8,7 @@ A minimal BitTorrent client implemented in modern C++17.
 - **Magnet link support (BEP 9)** with automatic metadata download
 - **Dynamic tracker list fetching** from online sources (trackerslist.com, ngosang/trackerslist)
 - HTTP/HTTPS/UDP tracker communication (BEP 15)
+- DHT peer discovery with iterative `get_peers` queries (BEP 5)
 - **Tracker strategy**: exponential failure backoff, success priority, bounded attempts per cycle
 - Peer connection and handshake
 - BitTorrent peer wire protocol (BEP 3)
@@ -68,8 +69,9 @@ gush [options] <torrent_file|magnet_link> [output_directory]
 When using magnet links, gush will:
 1. Parse the magnet link to extract the info hash
 2. Automatically fetch the latest tracker list from online sources
-3. Download metadata from peers using BEP 9 (Extension for Peers to Send Metadata Files)
-4. Start downloading the actual content
+3. Discover additional peers through DHT when tracker results are sparse
+4. Download metadata from peers using BEP 9 (Extension for Peers to Send Metadata Files)
+5. Start downloading the actual content with tracker, DHT and PEX discovery
 
 ## Project Structure
 
@@ -80,6 +82,7 @@ gush/
 │   ├── torrent.h           # Torrent file parsing
 │   ├── tracker.h           # Tracker protocol (HTTP/HTTPS/UDP)
 │   ├── tracker_manager.h   # Tracker strategy: backoff + priority
+│   ├── dht.h               # BEP 5 peer discovery
 │   ├── peer.h              # Peer connection handling
 │   ├── downloader.h        # Main download logic
 │   ├── metadata.h          # BEP 9 metadata download
@@ -103,13 +106,13 @@ cd build
 ctest --output-on-failure
 ```
 
-Unit tests cover bencode, magnet links, torrent parsing, tracker responses,
-tracker strategy and utilities. A CI workflow (`.github/workflows/ci.yml`)
+Unit tests cover bencode, magnet links, torrent parsing, tracker and DHT responses,
+peer protocols, downloader integration and utilities. A CI workflow (`.github/workflows/ci.yml`)
 runs the suite under Release and ASan/UBSan builds.
 
 ## Limitations (MVP)
 
-- DHT not yet implemented (relies on trackers for peer discovery)
+- DHT currently supports IPv4 peer discovery only (no BEP 5 announce/listener mode)
 - No encryption support
 
 ## License

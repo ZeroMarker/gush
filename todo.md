@@ -17,9 +17,9 @@
 
 ## P1 - 网络协议与下载效率
 
-- [ ] 增加 DHT peer discovery
-  - README 已说明 magnet 依赖 tracker，纯 hash magnet 成功率有限。
-  - 先实现 BEP 5 基础节点查询，再接入 magnet 元数据下载。
+- [x] 增加 DHT peer discovery
+  - 实现 BEP 5 UDP KRPC `get_peers` 有界迭代查询，支持 compact IPv4 nodes/peers；
+  - 接入 magnet 元数据下载与内容下载，在 tracker 失败或 peer 较少时补充发现。
 
 - [x] 实现 PEX 支持
   - 通过 BEP 10 扩展握手协商 `ut_pex`，解析 BEP 11 compact IPv4 peer 列表；
@@ -103,4 +103,4 @@
 2. ~~完成 piece SHA1 校验，防止错误数据落盘。~~
 3. ~~修复单文件/多文件写入抽象，并恢复多文件测试。~~
 4. ~~增加 Downloader/PeerConnection 本地协议测试。~~
-5. ~~推进 PEX 与 endgame mode。~~ DHT peer discovery 待做。
+5. ~~推进 DHT、PEX 与 endgame mode。~~

@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
 
             if (metadata.empty()) {
                 utils::logError("Failed to download metadata from peers");
-                utils::logError("Note: Magnet links require DHT or peer discovery to fetch metadata.");
+                utils::logError("No usable peers were found through trackers or DHT.");
                 return 1;
             }
 

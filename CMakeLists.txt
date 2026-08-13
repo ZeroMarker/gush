@@ -51,6 +51,7 @@ set(GUSH_LIB_SOURCES
     src/magnet.cpp
     src/metadata.cpp
     src/tracker_list.cpp
+    src/dht.cpp
 )
 
 set(HEADERS
@@ -63,6 +64,7 @@ set(HEADERS
     include/magnet.h
     include/metadata.h
     include/tracker_list.h
+    include/dht.h
 )
 
 add_library(gush_lib STATIC ${GUSH_LIB_SOURCES} ${HEADERS})
@@ -100,6 +102,7 @@ set(TEST_SOURCES
     tests/test_downloader.cpp
     tests/test_peer_connection.cpp
     tests/test_metadata.cpp
+    tests/test_dht.cpp
 )
 
 add_executable(test_gush ${TEST_SOURCES})

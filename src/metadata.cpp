@@ -2,6 +2,7 @@
 #include "tracker.h"
 #include "tracker_list.h"
 #include "bencode.h"
+#include "dht.h"
 #include "utils.h"
 #include <unistd.h>
 #include <sys/socket.h>
@@ -225,9 +226,25 @@ bool MetadataDownloader::start() {
         if (allPeers.size() >= MAX_PEERS) break;
     }
 
+    // Trackers are often missing or blocked for pure-hash magnets. Ask the
+    // public BEP 5 DHT when the tracker pass did not produce a healthy pool.
+    if (allPeers.size() < 20) {
+        utils::logInfo("Discovering peers via DHT...");
+        DhtOptions dhtOptions;
+        dhtOptions.queryTimeoutMs = 600;
+        dhtOptions.maxQueries = 16;
+        dhtOptions.maxPeers = MAX_PEERS - allPeers.size();
+        auto dhtPeers = discoverDhtPeers(magnet_.infoHashRaw, {}, dhtOptions);
+        for (const auto& peer : dhtPeers) {
+            if (std::find(allPeers.begin(), allPeers.end(), peer) == allPeers.end()) {
+                allPeers.push_back(peer);
+            }
+        }
+        utils::logDebug("DHT discovered " + std::to_string(dhtPeers.size()) + " peers");
+    }
+
     if (allPeers.empty()) {
-        utils::logError("No peers available from any tracker");
-        utils::logError("Note: Pure hash magnet links may need DHT for peer discovery");
+        utils::logError("No peers available from trackers or DHT");
         return false;
     }
 
