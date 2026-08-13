@@ -231,6 +231,17 @@ std::filesystem::path tempDir() {
 
 }  // namespace
 
+TEST(DownloaderTest, GetStatsDoesNotRelockProgressMutex) {
+    const std::string data(kBlockSize, 'S');
+    TorrentInfo torrent = makeSingleFileTorrent(data, "stats.bin");
+    Downloader downloader(torrent, ".");
+
+    DownloadStats stats = downloader.getStats();
+    EXPECT_EQ(stats.downloaded, 0);
+    EXPECT_EQ(stats.totalLength, kBlockSize);
+    EXPECT_DOUBLE_EQ(stats.progress, 0.0);
+}
+
 TEST(DownloaderTest, DownloadSinglePieceFromLocalPeer) {
     const std::string pieceData(kBlockSize, 'A');
     TorrentInfo torrent = makeSingleFileTorrent(pieceData, "test.bin");

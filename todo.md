@@ -104,3 +104,41 @@
 3. ~~修复单文件/多文件写入抽象，并恢复多文件测试。~~
 4. ~~增加 Downloader/PeerConnection 本地协议测试。~~
 5. ~~推进 DHT、PEX 与 endgame mode。~~
+
+---
+
+# 下一阶段计划
+
+## P0 - 正确性与输入安全
+
+- [x] 修复 `Downloader::getStats()` 重入锁死锁
+  - 避免持有 `mutex_` 时再次调用会加锁的 `getProgress()`，增加统计接口回归测试。
+
+- [x] 统一 BEP 10 扩展协议握手能力位
+  - metadata 与常规 peer 均使用 reserved byte 5 的 `0x10` 标志，补握手字节测试。
+
+- [x] 严格校验 torrent 与 magnet metadata
+  - 校验 piece length、pieces 哈希长度、文件长度、路径及 piece 数与总长度的一致性；
+  - 拒绝负数、空文件列表、缺失字段和算术溢出。
+
+## P1 - 下载连续性与发现能力
+
+- [ ] 支持断点续传
+  - 保留已有文件，启动时逐 piece 校验并恢复进度；提供显式覆盖选项。
+
+- [ ] 完善 DHT 生命周期
+  - 下载停滞时重新查询，按 XOR 距离选择节点，支持 `nodes6`、routing table、
+    `announce_peer`、token 校验、UDP listener 和 `--no-dht`。
+
+- [ ] 改善网络请求取消与退出延迟
+  - tracker、DHT 与 metadata 请求支持统一 deadline 和停止信号，避免退出长时间阻塞。
+
+## P2 - 安全与完整协议能力
+
+- [ ] 恢复 HTTPS tracker 证书与主机名验证
+
+- [ ] 限制 bencode 与网络响应资源消耗并增加 fuzz 测试
+  - 限制嵌套深度、字符串/容器/响应大小，严格检查整数格式与溢出。
+
+- [ ] 补全 peer wire 上传与做种能力
+  - 响应 request、上传 block、choking/unchoking 策略和上传统计。

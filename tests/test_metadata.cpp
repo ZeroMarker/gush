@@ -137,6 +137,7 @@ private:
         std::vector<uint8_t> hs(68);
         if (!recvFull(fd, hs.data(), 68)) return;
         if (hs[0] != 19) return;
+        EXPECT_NE(hs[25] & 0x10, 0);       // BEP 10 reserved byte 5
 
         std::vector<uint8_t> resp(68, 0);
         resp[0] = 19;

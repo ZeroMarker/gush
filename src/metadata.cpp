@@ -339,9 +339,9 @@ bool MetadataDownloader::performHandshake(int sock) {
     memcpy(&handshake[1], "BitTorrent protocol", 19);
 
     // Reserved bytes: set the BEP 10 extended-protocol bit (0x10 in the last
-    // reserved byte, i.e. byte index 27).
+    // reserved byte 5, i.e. handshake byte index 25).
     memset(&handshake[20], 0, 8);
-    handshake[27] = 0x10;
+    handshake[25] = 0x10;
 
     // Info hash
     memcpy(&handshake[28], magnet_.infoHashRaw.c_str(), 20);

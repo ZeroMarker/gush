@@ -11,7 +11,7 @@ struct TorrentInfo {
     std::string name;
     std::string comment;
     std::string createdBy;
-    int64_t pieceLength;
+    int64_t pieceLength = 0;
     std::string pieces;  // Raw SHA1 hashes concatenated
     std::vector<std::string> announceList;
     std::string infoHash;  // SHA1 of bencoded info dict
@@ -19,12 +19,12 @@ struct TorrentInfo {
     
     // Single file mode
     std::string fileName;
-    int64_t fileLength;
+    int64_t fileLength = 0;
     
     // Multi file mode
     struct FileEntry {
         std::string path;
-        int64_t length;
+        int64_t length = 0;
     };
     std::vector<FileEntry> files;
     
@@ -35,6 +35,9 @@ struct TorrentInfo {
 
 // Load torrent from file
 TorrentInfo loadTorrent(const std::string& filename);
+
+// Validate invariants shared by .torrent files and magnet metadata.
+void validateTorrentInfo(const TorrentInfo& torrent);
 
 // Generate peer ID
 std::string generatePeerId();

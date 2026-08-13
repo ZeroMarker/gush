@@ -954,7 +954,9 @@ DownloadStats Downloader::getStats() const {
     stats.totalLength = torrent_.totalLength();
     stats.downloadSpeed = currentSpeed_;
     stats.currentSpeed = currentSpeed_;
-    stats.progress = getProgress();
+    const int64_t total = torrent_.totalLength();
+    stats.progress = total <= 0 ? 0.0 :
+        std::min(1.0, static_cast<double>(downloadedBytes_) / total);
     stats.connectedPeers = static_cast<int>(peers_.size());
     stats.activePeers = 0;
 

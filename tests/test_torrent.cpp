@@ -287,6 +287,53 @@ TEST(TorrentTest, LoadTorrentMissingInfo) {
     std::remove(testFile.c_str());
 }
 
+TEST(TorrentTest, RejectsZeroPieceLength) {
+    bencode::BencodeDict info;
+    info["length"] = int64_t(1);
+    info["name"] = bencode::BencodeString("bad.bin");
+    info["piece length"] = int64_t(0);
+    info["pieces"] = bencode::BencodeString(std::string(20, 'x'));
+    bencode::BencodeDict root;
+    root["info"] = std::move(info);
+
+    const std::string path = "/tmp/test_zero_piece_length.torrent";
+    writeTempFile(path, bencode::encode(bencode::BencodeValue(std::move(root))));
+    EXPECT_THROW(loadTorrent(path), std::runtime_error);
+    std::remove(path.c_str());
+}
+
+TEST(TorrentTest, RejectsMalformedPieceHashes) {
+    const std::string path = "/tmp/test_bad_piece_hashes.torrent";
+    writeTempFile(path, buildSingleTorrent("bad.bin", 1, std::string(19, 'x')));
+    EXPECT_THROW(loadTorrent(path), std::runtime_error);
+    std::remove(path.c_str());
+}
+
+TEST(TorrentTest, RejectsPieceCountMismatch) {
+    const std::string path = "/tmp/test_piece_count_mismatch.torrent";
+    writeTempFile(path, buildSingleTorrent("bad.bin", 32768, std::string(20, 'x')));
+    EXPECT_THROW(loadTorrent(path), std::runtime_error);
+    std::remove(path.c_str());
+}
+
+TEST(TorrentTest, RejectsInvalidMultiFileEntry) {
+    bencode::BencodeDict file;
+    file["length"] = int64_t(-1);
+    file["path"] = bencode::BencodeList{bencode::BencodeString("bad.bin")};
+    bencode::BencodeDict info;
+    info["files"] = bencode::BencodeList{bencode::BencodeValue(std::move(file))};
+    info["name"] = bencode::BencodeString("bad");
+    info["piece length"] = int64_t(16384);
+    info["pieces"] = bencode::BencodeString(std::string(20, 'x'));
+    bencode::BencodeDict root;
+    root["info"] = std::move(info);
+
+    const std::string path = "/tmp/test_invalid_multifile.torrent";
+    writeTempFile(path, bencode::encode(bencode::BencodeValue(std::move(root))));
+    EXPECT_THROW(loadTorrent(path), std::runtime_error);
+    std::remove(path.c_str());
+}
+
 // Test TorrentInfo copy/move
 TEST(TorrentTest, TorrentInfoMove) {
     std::string testFile = "/tmp/test_single.torrent";

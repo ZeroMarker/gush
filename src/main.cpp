@@ -177,28 +177,37 @@ TorrentInfo createTorrentFromMetadata(const MagnetLink& magnet, const std::strin
     const auto* files = bencode::dictGet(infoDict, "files");
     if (files && files->isList()) {
         // Multi-file mode
+        if (files->asList().empty()) {
+            throw std::runtime_error("Invalid metadata: empty files list");
+        }
         for (const auto& fileEntry : files->asList()) {
-            if (!fileEntry.isDict()) continue;
+            if (!fileEntry.isDict()) {
+                throw std::runtime_error("Invalid metadata: file entry is not a dictionary");
+            }
 
             const auto& fileDict = fileEntry.asDict();
             TorrentInfo::FileEntry entry;
 
             const auto* length = bencode::dictGet(fileDict, "length");
-            if (length && length->isInt()) {
-                entry.length = length->asInt();
+            if (!length || !length->isInt()) {
+                throw std::runtime_error("Invalid metadata: missing file length");
             }
+            entry.length = length->asInt();
 
             const auto* path = bencode::dictGet(fileDict, "path");
-            if (path && path->isList()) {
+            if (path && path->isList() && !path->asList().empty()) {
                 std::ostringstream pathOss;
                 const auto& pathList = path->asList();
                 for (size_t i = 0; i < pathList.size(); i++) {
                     if (i > 0) pathOss << "/";
-                    if (pathList[i].isString()) {
-                        pathOss << std::get<bencode::BencodeString>(pathList[i].data);
+                    if (!pathList[i].isString() || pathList[i].asString().empty()) {
+                        throw std::runtime_error("Invalid metadata: invalid file path component");
                     }
+                    pathOss << pathList[i].asString();
                 }
                 entry.path = pathOss.str();
+            } else {
+                throw std::runtime_error("Invalid metadata: missing file path");
             }
 
             torrent.files.push_back(entry);
@@ -206,9 +215,10 @@ TorrentInfo createTorrentFromMetadata(const MagnetLink& magnet, const std::strin
     } else {
         // Single file mode
         const auto* length = bencode::dictGet(infoDict, "length");
-        if (length && length->isInt()) {
-            torrent.fileLength = length->asInt();
+        if (!length || !length->isInt()) {
+            throw std::runtime_error("Invalid metadata: missing length");
         }
+        torrent.fileLength = length->asInt();
         torrent.fileName = torrent.name;
     }
 
@@ -216,6 +226,8 @@ TorrentInfo createTorrentFromMetadata(const MagnetLink& magnet, const std::strin
     if (torrent.name.empty() && !magnet.displayName.empty()) {
         torrent.name = magnet.displayName;
     }
+
+    validateTorrentInfo(torrent);
 
     return torrent;
 }

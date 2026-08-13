@@ -5,6 +5,7 @@
 #include <sstream>
 #include <random>
 #include <chrono>
+#include <limits>
 
 int64_t TorrentInfo::totalLength() const {
     if (isMultiFile()) {
@@ -19,6 +20,46 @@ int64_t TorrentInfo::totalLength() const {
 
 std::size_t TorrentInfo::numPieces() const {
     return pieces.size() / 20;  // Each hash is 20 bytes (SHA1)
+}
+
+void validateTorrentInfo(const TorrentInfo& torrent) {
+    if (torrent.name.empty()) {
+        throw std::runtime_error("Invalid torrent: empty name");
+    }
+    if (torrent.pieceLength <= 0) {
+        throw std::runtime_error("Invalid torrent: piece length must be positive");
+    }
+    if (torrent.pieces.size() % 20 != 0) {
+        throw std::runtime_error("Invalid torrent: pieces length is not a multiple of 20");
+    }
+
+    int64_t total = 0;
+    if (torrent.isMultiFile()) {
+        for (const auto& entry : torrent.files) {
+            if (entry.path.empty()) {
+                throw std::runtime_error("Invalid torrent: empty file path");
+            }
+            if (entry.length < 0) {
+                throw std::runtime_error("Invalid torrent: negative file length");
+            }
+            if (entry.length > std::numeric_limits<int64_t>::max() - total) {
+                throw std::runtime_error("Invalid torrent: total length overflow");
+            }
+            total += entry.length;
+        }
+    } else {
+        if (torrent.fileLength < 0) {
+            throw std::runtime_error("Invalid torrent: negative file length");
+        }
+        total = torrent.fileLength;
+    }
+
+    const uint64_t expectedPieces = total == 0 ? 0 :
+        1 + (static_cast<uint64_t>(total) - 1) /
+                static_cast<uint64_t>(torrent.pieceLength);
+    if (torrent.numPieces() != expectedPieces) {
+        throw std::runtime_error("Invalid torrent: piece hash count does not match total length");
+    }
 }
 
 std::string generatePeerId() {
@@ -155,28 +196,37 @@ TorrentInfo loadTorrent(const std::string& filename) {
     const auto* files = bencode::dictGet(infoDict, "files");
     if (files && files->isList()) {
         // Multi-file mode
+        if (files->asList().empty()) {
+            throw std::runtime_error("Invalid torrent file: empty files list");
+        }
         for (const auto& fileEntry : files->asList()) {
-            if (!fileEntry.isDict()) continue;
+            if (!fileEntry.isDict()) {
+                throw std::runtime_error("Invalid torrent file: file entry is not a dictionary");
+            }
             
             const auto& fileDict = fileEntry.asDict();
             TorrentInfo::FileEntry entry;
             
             const auto* length = bencode::dictGet(fileDict, "length");
-            if (length && length->isInt()) {
-                entry.length = length->asInt();
+            if (!length || !length->isInt()) {
+                throw std::runtime_error("Invalid torrent file: missing file length");
             }
+            entry.length = length->asInt();
             
             const auto* path = bencode::dictGet(fileDict, "path");
-            if (path && path->isList()) {
+            if (path && path->isList() && !path->asList().empty()) {
                 std::ostringstream pathOss;
                 const auto& pathList = path->asList();
                 for (size_t i = 0; i < pathList.size(); i++) {
                     if (i > 0) pathOss << "/";
-                    if (pathList[i].isString()) {
-                        pathOss << std::get<bencode::BencodeString>(pathList[i].data);
+                    if (!pathList[i].isString() || pathList[i].asString().empty()) {
+                        throw std::runtime_error("Invalid torrent file: invalid file path component");
                     }
+                    pathOss << pathList[i].asString();
                 }
                 entry.path = pathOss.str();
+            } else {
+                throw std::runtime_error("Invalid torrent file: missing file path");
             }
             
             torrent.files.push_back(entry);
@@ -184,11 +234,14 @@ TorrentInfo loadTorrent(const std::string& filename) {
     } else {
         // Single file mode
         const auto* length = bencode::dictGet(infoDict, "length");
-        if (length && length->isInt()) {
-            torrent.fileLength = length->asInt();
+        if (!length || !length->isInt()) {
+            throw std::runtime_error("Invalid torrent file: missing length");
         }
+        torrent.fileLength = length->asInt();
         torrent.fileName = torrent.name;
     }
+
+    validateTorrentInfo(torrent);
     
     // Calculate info hash (SHA1 of the ORIGINAL bencoded info dict bytes)
     std::string infoEncoded = extractInfoDictBytes(content, *info);
