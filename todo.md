@@ -50,9 +50,10 @@
   - 顺带发现并修复：bitfield_ 未初始化，不发 bitfield 的 peer 其 have 消息
     全部被丢弃；超大帧/发送失败时自动断开连接。
 
-- [ ] 恢复并修正多文件 torrent 测试
-  - `tests/test_torrent.cpp` 中已有被注释的多文件测试。
-  - 改成稳定构造 bencode fixture 后启用。
+- [x] 恢复并修正多文件 torrent 测试
+  - `tests/test_torrent.cpp` 使用 bencode encoder 稳定构造多文件 fixture，
+    覆盖文件列表解析与总长度计算。
+  - `tests/test_downloader.cpp` 进一步覆盖 piece 横跨多个文件边界时的写盘行为。
 
 - [x] 增加 metadata downloader 测试
   - `tests/test_metadata.cpp`：本地 mock peer 模拟 BEP 9/10 扩展握手（分片）、
@@ -100,5 +101,5 @@
 1. ~~添加 `.gitignore` 和 CI，固定基础工程质量门槛。~~
 2. ~~完成 piece SHA1 校验，防止错误数据落盘。~~
 3. ~~修复单文件/多文件写入抽象，并恢复多文件测试。~~
-4. ~~增加 Downloader/PeerConnection 本地协议测试。~~（Downloader/Peer 测试仍待补）
+4. ~~增加 Downloader/PeerConnection 本地协议测试。~~
 5. 再推进 DHT、PEX、endgame mode 等协议能力。（endgame 已完成，DHT/PEX 待做）
