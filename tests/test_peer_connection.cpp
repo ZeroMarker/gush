@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "peer.h"
+#include "bencode.h"
 #include "utils.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -101,7 +102,8 @@ private:
 // Server-side handshake: verify the client's 68-byte handshake, reply with
 // our own, then consume the client's interested message (5 bytes).
 bool serverHandshake(int fd, const std::string& infoHash,
-                     std::vector<uint8_t>& clientHandshake) {
+                     std::vector<uint8_t>& clientHandshake,
+                     bool extensions = false) {
     clientHandshake.resize(68);
     if (!recvFull(fd, clientHandshake.data(), 68)) return false;
     if (clientHandshake[0] != 19) return false;
@@ -109,6 +111,7 @@ bool serverHandshake(int fd, const std::string& infoHash,
     std::vector<uint8_t> resp(68, 0);
     resp[0] = 19;
     memcpy(&resp[1], "BitTorrent protocol", 19);
+    if (extensions) resp[25] |= 0x10;
     memcpy(&resp[28], infoHash.data(), 20);
     memcpy(&resp[48], "-GT0001-SERVER-0000", 20);
     if (!sendFull(fd, resp.data(), 68)) return false;
@@ -359,5 +362,82 @@ TEST(PeerConnectionTest, ReadBlockRejectsMismatchedOffset) {
 
     std::vector<uint8_t> data;
     EXPECT_FALSE(conn.readBlock(0, 0, 64, data));
+    peer.join();
+}
+
+TEST(PeerConnectionTest, ExtensionHandshakeAndPexDiscovery) {
+    TorrentInfo torrent = makeTorrent();
+    FakePeer peer;
+    ASSERT_TRUE(peer.start());
+
+    std::vector<uint8_t> clientHs;
+    uint8_t extensionMessageId = 0;
+    std::vector<uint8_t> extensionPayload;
+    peer.serve([&](int fd) {
+        ASSERT_TRUE(serverHandshake(fd, torrent.infoHash, clientHs,
+                                    /*extensions=*/true));
+        EXPECT_NE(clientHs[25] & 0x10, 0);  // client advertises BEP 10
+
+        ASSERT_TRUE(readClientMessage(fd, extensionMessageId, extensionPayload));
+        ASSERT_EQ(extensionMessageId, static_cast<uint8_t>(MessageId::Extended));
+        ASSERT_FALSE(extensionPayload.empty());
+        EXPECT_EQ(extensionPayload[0], 0);  // extended handshake
+
+        std::string clientDict(extensionPayload.begin() + 1, extensionPayload.end());
+        auto decoded = bencode::parse(clientDict);
+        ASSERT_TRUE(decoded.isDict());
+        const auto* mapping = bencode::dictGet(decoded.asDict(), "m");
+        ASSERT_NE(mapping, nullptr);
+        ASSERT_TRUE(mapping->isDict());
+        EXPECT_EQ(bencode::dictGetInt(mapping->asDict(), "ut_pex"), 1);
+
+        bencode::BencodeDict remoteExtensions;
+        remoteExtensions["ut_pex"] = int64_t(7);
+        bencode::BencodeDict remoteHandshake;
+        remoteHandshake["m"] = std::move(remoteExtensions);
+        std::string encodedHandshake = bencode::encode(
+            bencode::BencodeValue(std::move(remoteHandshake)));
+        std::vector<uint8_t> handshakePayload{0};
+        handshakePayload.insert(handshakePayload.end(), encodedHandshake.begin(),
+                                encodedHandshake.end());
+        sendServerMessage(fd, static_cast<uint8_t>(MessageId::Extended),
+                          handshakePayload, /*split=*/true);
+
+        // Two compact IPv4 peers followed by a duplicate. Port zero is invalid
+        // and must not be exposed to the downloader.
+        std::string added;
+        const uint8_t compact[] = {
+            1, 2, 3, 4, 0x1A, 0xE1,       // 6881
+            5, 6, 7, 8, 0xC8, 0xD5,       // 51413
+            1, 2, 3, 4, 0x1A, 0xE1,       // duplicate
+            9, 9, 9, 9, 0x00, 0x00        // invalid port
+        };
+        added.assign(reinterpret_cast<const char*>(compact), sizeof(compact));
+        bencode::BencodeDict pex;
+        pex["added"] = std::move(added);
+        std::string encodedPex = bencode::encode(bencode::BencodeValue(std::move(pex)));
+        std::vector<uint8_t> pexPayload{1};  // our advertised ut_pex ID
+        pexPayload.insert(pexPayload.end(), encodedPex.begin(), encodedPex.end());
+        sendServerMessage(fd, static_cast<uint8_t>(MessageId::Extended), pexPayload,
+                          /*split=*/true);
+        usleep(50000);
+    });
+
+    PeerConnection conn("127.0.0.1", peer.port(), torrent, peerId20());
+    ASSERT_TRUE(conn.connect());
+
+    PeerMessage msg;
+    ASSERT_TRUE(recvMsgWithRetry(conn, msg));
+    EXPECT_EQ(msg.id, MessageId::Extended);
+    ASSERT_TRUE(recvMsgWithRetry(conn, msg));
+    EXPECT_EQ(msg.id, MessageId::Extended);
+
+    auto discovered = conn.takeDiscoveredPeers();
+    ASSERT_EQ(discovered.size(), 2u);
+    EXPECT_EQ(discovered[0].ip, "1.2.3.4");
+    EXPECT_EQ(discovered[0].port, 6881);
+    EXPECT_EQ(discovered[1].ip, "5.6.7.8");
+    EXPECT_EQ(discovered[1].port, 51413);
+    EXPECT_TRUE(conn.takeDiscoveredPeers().empty());
     peer.join();
 }

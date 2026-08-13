@@ -20,6 +20,7 @@ enum class MessageId : uint8_t {
     Block = 7,
     Cancel = 8,
     Port = 9,
+    Extended = 20,
     KeepAlive = 255  // Special case: length 0
 };
 
@@ -58,6 +59,9 @@ public:
     bool receiveMessage(PeerMessage& msg);
     bool receiveMessageNonBlocking(PeerMessage& msg);
 
+    // Return peers learned from ut_pex since the previous call.
+    std::vector<Peer> takeDiscoveredPeers();
+
     // Read a block (piece data)
     bool readBlock(uint32_t piece, uint32_t offset, uint32_t length, std::vector<uint8_t>& data);
     
@@ -79,6 +83,8 @@ public:
 private:
     bool performHandshake();
     bool sendMessage(const PeerMessage& msg);
+    bool sendExtensionHandshake();
+    void processExtendedMessage(const std::vector<uint8_t>& payload);
     void updateBitfield(const std::vector<uint8_t>& data);
     
     std::string ip_;
@@ -94,8 +100,11 @@ private:
     bool amInterested_ = false;
     bool peerChoking_ = true;
     bool peerInterested_ = false;
+    bool peerSupportsExtensions_ = false;
+    bool peerSupportsPex_ = false;
     
     std::vector<bool> bitfield_;
+    std::vector<Peer> discoveredPeers_;
 };
 
 #endif // PEER_H

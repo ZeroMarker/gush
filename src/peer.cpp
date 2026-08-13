@@ -1,4 +1,5 @@
 #include "peer.h"
+#include "bencode.h"
 #include "utils.h"
 #include <cstring>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 
 namespace {
 constexpr uint32_t MAX_PEER_MESSAGE_SIZE = 4 * 1024 * 1024;
+constexpr size_t MAX_PEX_PEERS_PER_MESSAGE = 200;
 
 bool sendAll(int socket, const uint8_t* data, size_t size) {
     size_t totalSent = 0;
@@ -217,8 +219,9 @@ bool PeerConnection::performHandshake() {
     // Protocol string: "BitTorrent protocol"
     memcpy(&handshake[1], "BitTorrent protocol", 19);
     
-    // Reserved bytes (all zeros)
+    // Reserved bytes. Advertise BEP 10 extension protocol support.
     memset(&handshake[20], 0, 8);
+    handshake[25] |= 0x10;
     
     // Info hash
     memcpy(&handshake[28], torrent_.infoHash.c_str(), 20);
@@ -258,6 +261,8 @@ bool PeerConnection::performHandshake() {
     if (memcmp(&recvHandshake[28], torrent_.infoHash.c_str(), 20) != 0) {
         return false;
     }
+
+    peerSupportsExtensions_ = (recvHandshake[25] & 0x10) != 0;
     
     // Get peer ID (optional, store if needed)
 
@@ -267,7 +272,8 @@ bool PeerConnection::performHandshake() {
     bitfield_.assign(torrent_.numPieces(), false);
 
     // Send interested (to let peer know we want data)
-    sendInterested();
+    if (!sendInterested()) return false;
+    if (peerSupportsExtensions_ && !sendExtensionHandshake()) return false;
     
     // Note: We are now interested, but peer is still choking us
     // We need to wait for peer to unchoke before requesting blocks
@@ -328,6 +334,69 @@ bool PeerConnection::sendRequest(uint32_t piece, uint32_t offset, uint32_t lengt
 
 bool PeerConnection::sendCancel(uint32_t piece, uint32_t offset, uint32_t length) {
     return sendMessage(PeerMessage::createCancel(piece, offset, length));
+}
+
+bool PeerConnection::sendExtensionHandshake() {
+    bencode::BencodeDict extensions;
+    extensions["ut_pex"] = int64_t(1);
+    bencode::BencodeDict handshake;
+    handshake["m"] = std::move(extensions);
+    std::string encoded = bencode::encode(bencode::BencodeValue(std::move(handshake)));
+
+    PeerMessage msg;
+    msg.id = MessageId::Extended;
+    msg.payload.reserve(encoded.size() + 1);
+    msg.payload.push_back(0);  // extended handshake
+    msg.payload.insert(msg.payload.end(), encoded.begin(), encoded.end());
+    msg.length = static_cast<uint32_t>(1 + msg.payload.size());
+    return sendMessage(msg);
+}
+
+void PeerConnection::processExtendedMessage(const std::vector<uint8_t>& payload) {
+    if (payload.size() < 2) return;
+
+    const uint8_t extensionId = payload[0];
+    const std::string encoded(payload.begin() + 1, payload.end());
+    try {
+        const auto value = bencode::parse(encoded);
+        if (!value.isDict()) return;
+
+        if (extensionId == 0) {
+            const auto* mapping = bencode::dictGet(value.asDict(), "m");
+            if (mapping && mapping->isDict()) {
+                const auto id = bencode::dictGetInt(mapping->asDict(), "ut_pex");
+                peerSupportsPex_ = id && *id > 0 && *id <= 255;
+            }
+            return;
+        }
+
+        // We advertised ut_pex as local extension ID 1. Incoming PEX messages
+        // therefore use ID 1, regardless of the ID chosen by the remote peer.
+        if (extensionId != 1 || !peerSupportsPex_) return;
+        const auto compact = bencode::dictGetString(value.asDict(), "added");
+        if (!compact) return;
+
+        for (auto& peer : parseCompactPeers(*compact)) {
+            if (discoveredPeers_.size() >= MAX_PEX_PEERS_PER_MESSAGE) break;
+            if (peer.port == 0 || (peer.ip == ip_ && peer.port == port_)) continue;
+            bool duplicate = false;
+            for (const auto& existing : discoveredPeers_) {
+                if (existing == peer) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) discoveredPeers_.push_back(std::move(peer));
+        }
+    } catch (...) {
+        // Extension messages are untrusted; malformed PEX data is ignored.
+    }
+}
+
+std::vector<Peer> PeerConnection::takeDiscoveredPeers() {
+    std::vector<Peer> peers;
+    peers.swap(discoveredPeers_);
+    return peers;
 }
 
 bool PeerConnection::receiveMessage(PeerMessage& msg) {
@@ -397,6 +466,9 @@ bool PeerConnection::receiveMessage(PeerMessage& msg) {
             break;
         case MessageId::Bitfield:
             updateBitfield(msg.payload);
+            break;
+        case MessageId::Extended:
+            processExtendedMessage(msg.payload);
             break;
         default:
             break;
@@ -505,6 +577,9 @@ bool PeerConnection::receiveMessageNonBlocking(PeerMessage& msg) {
             break;
         case MessageId::Block:
             // Block message - payload will be processed by downloader
+            break;
+        case MessageId::Extended:
+            processExtendedMessage(msg.payload);
             break;
         default:
             break;

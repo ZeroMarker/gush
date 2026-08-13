@@ -11,6 +11,7 @@ A minimal BitTorrent client implemented in modern C++17.
 - **Tracker strategy**: exponential failure backoff, success priority, bounded attempts per cycle
 - Peer connection and handshake
 - BitTorrent peer wire protocol (BEP 3)
+- Peer exchange via `ut_pex` (BEP 10/11)
 - Piece SHA1 verification before writing to disk
 - Rarest-first piece selection with partial-completion priority
 - **Endgame mode**: duplicate block requests near completion so slow peers cannot stall the finish
@@ -109,7 +110,6 @@ runs the suite under Release and ASan/UBSan builds.
 ## Limitations (MVP)
 
 - DHT not yet implemented (relies on trackers for peer discovery)
-- No peer exchange (PEX)
 - No encryption support
 
 ## License

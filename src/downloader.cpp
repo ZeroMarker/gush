@@ -522,6 +522,7 @@ uint32_t Downloader::selectNextPiece() {
 
 void Downloader::processPeerMessages() {
     const uint32_t blockSize = 16384;
+    std::vector<Peer> pexPeers;
 
     for (auto& peerPtr : peers_) {
         if (!peerPtr || !peerPtr->isConnected()) continue;
@@ -671,6 +672,15 @@ void Downloader::processPeerMessages() {
                     break;
             }
         }
+
+        auto discovered = peer->takeDiscoveredPeers();
+        pexPeers.insert(pexPeers.end(), discovered.begin(), discovered.end());
+    }
+
+    // Adding peers can reallocate peers_, so defer it until iteration finishes.
+    if (!pexPeers.empty()) {
+        utils::logDebug("PEX discovered " + std::to_string(pexPeers.size()) + " peers");
+        addPeers(pexPeers);
     }
 }
 

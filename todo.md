@@ -21,8 +21,9 @@
   - README 已说明 magnet 依赖 tracker，纯 hash magnet 成功率有限。
   - 先实现 BEP 5 基础节点查询，再接入 magnet 元数据下载。
 
-- [ ] 实现 PEX 支持
-  - 支持从已连接 peer 获取更多 peer，减少对 tracker 的依赖。
+- [x] 实现 PEX 支持
+  - 通过 BEP 10 扩展握手协商 `ut_pex`，解析 BEP 11 compact IPv4 peer 列表；
+  - 对发现结果过滤无效端口、来源 peer 和重复地址，再安全加入下载队列。
 
 - [x] 改进 tracker 策略
   - `TrackerManager`：指数退避（30s 起，上限 30min）、成功优先级（上次成功的 tracker 优先）、
@@ -102,4 +103,4 @@
 2. ~~完成 piece SHA1 校验，防止错误数据落盘。~~
 3. ~~修复单文件/多文件写入抽象，并恢复多文件测试。~~
 4. ~~增加 Downloader/PeerConnection 本地协议测试。~~
-5. 再推进 DHT、PEX、endgame mode 等协议能力。（endgame 已完成，DHT/PEX 待做）
+5. ~~推进 PEX 与 endgame mode。~~ DHT peer discovery 待做。
