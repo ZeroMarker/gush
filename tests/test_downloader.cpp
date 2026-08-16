@@ -10,6 +10,8 @@
 #include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <mutex>
+#include <algorithm>
 
 namespace {
 
@@ -95,6 +97,11 @@ public:
 
     uint16_t port() const { return port_; }
 
+    std::vector<uint32_t> requestedPieces() const {
+        std::lock_guard<std::mutex> lock(requestMutex_);
+        return requestedPieces_;
+    }
+
     void join() {
         if (thread_.joinable()) thread_.join();
         if (lfd_ >= 0) close(lfd_);
@@ -136,7 +143,7 @@ private:
                 // Unchoke (split) + bitfield: peer has piece 0
                 if (!sendMessageSplit(fd, 1, {}, true)) return;
                 if (!servedBitfield) {
-                    std::vector<uint8_t> bf(1, 0x80);
+                    std::vector<uint8_t> bf(1, 0xFF);
                     if (!sendMessageSplit(fd, 5, bf, false)) return;
                     servedBitfield = true;
                 }
@@ -146,8 +153,12 @@ private:
                 uint32_t piece = readBE32(payload.data());
                 uint32_t offset = readBE32(payload.data() + 4);
                 uint32_t length = readBE32(payload.data() + 8);
-                (void)piece;
-                if (offset + length > pieceData_.size()) return;
+                {
+                    std::lock_guard<std::mutex> lock(requestMutex_);
+                    requestedPieces_.push_back(piece);
+                }
+                const size_t absoluteOffset = static_cast<size_t>(piece) * kBlockSize + offset;
+                if (absoluteOffset + length > pieceData_.size()) return;
 
                 std::vector<uint8_t> msg;
                 msg.reserve(8 + length);
@@ -159,8 +170,8 @@ private:
                 msg.push_back(static_cast<uint8_t>((offset >> 16) & 0xFF));
                 msg.push_back(static_cast<uint8_t>((offset >> 8) & 0xFF));
                 msg.push_back(static_cast<uint8_t>(offset & 0xFF));
-                msg.insert(msg.end(), pieceData_.begin() + offset,
-                           pieceData_.begin() + offset + length);
+                msg.insert(msg.end(), pieceData_.begin() + absoluteOffset,
+                           pieceData_.begin() + absoluteOffset + length);
                 if (!sendMessageSplit(fd, 7, msg, true)) return;  // block, split payload
             } else {
                 std::vector<uint8_t> skip(len - 1);
@@ -177,6 +188,8 @@ private:
     int lfd_ = -1;
     uint16_t port_ = 0;
     std::thread thread_;
+    mutable std::mutex requestMutex_;
+    std::vector<uint32_t> requestedPieces_;
 };
 
 // Make a single-file torrent with exactly one 16 KiB piece
@@ -221,6 +234,12 @@ std::string readFile(const std::filesystem::path& p) {
                        std::istreambuf_iterator<char>());
 }
 
+void writeFile(const std::filesystem::path& p, const std::string& data) {
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream f(p, std::ios::binary);
+    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
 std::filesystem::path tempDir() {
     auto dir = std::filesystem::temp_directory_path() /
                ("gush_test_" + std::to_string(::getpid()) + "_" +
@@ -240,6 +259,140 @@ TEST(DownloaderTest, GetStatsDoesNotRelockProgressMutex) {
     EXPECT_EQ(stats.downloaded, 0);
     EXPECT_EQ(stats.totalLength, kBlockSize);
     EXPECT_DOUBLE_EQ(stats.progress, 0.0);
+}
+
+TEST(DownloaderTest, ResumesVerifiedSingleFileWithoutPeers) {
+    const std::string data(kBlockSize, 'R');
+    TorrentInfo torrent = makeSingleFileTorrent(data, "resume.bin");
+    auto dir = tempDir();
+    writeFile(dir / "resume.bin", data);
+
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.start();
+
+    EXPECT_TRUE(downloader.isComplete());
+    EXPECT_FALSE(downloader.isRunning());
+    EXPECT_EQ(downloader.getStats().downloaded, kBlockSize);
+    EXPECT_EQ(readFile(dir / "resume.bin"), data);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(DownloaderTest, ResumesVerifiedMultiFilePiece) {
+    const std::string data(kBlockSize, 'M');
+    TorrentInfo torrent = makeMultiFileTorrent(data);
+    auto dir = tempDir();
+    writeFile(dir / "dir1" / "a.bin", data.substr(0, 10000));
+    writeFile(dir / "b.bin", data.substr(10000));
+
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.start();
+
+    EXPECT_TRUE(downloader.isComplete());
+    EXPECT_FALSE(downloader.isRunning());
+    EXPECT_EQ(downloader.getStats().downloaded, kBlockSize);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(DownloaderTest, CorruptExistingPieceIsDownloadedAgain) {
+    const std::string data(kBlockSize, 'V');
+    TorrentInfo torrent = makeSingleFileTorrent(data, "repair.bin");
+    auto dir = tempDir();
+    writeFile(dir / "repair.bin", std::string(kBlockSize, 'X'));
+
+    MockPeerServer server(torrent.infoHash, data);
+    ASSERT_TRUE(server.start());
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    opts.maxPeers = 4;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.addPeers({Peer{"127.0.0.1", server.port(), ""}});
+    downloader.start();
+
+    for (int i = 0; i < 300 && !downloader.isComplete(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    downloader.stop();
+    server.join();
+    EXPECT_TRUE(downloader.isComplete());
+    EXPECT_EQ(readFile(dir / "repair.bin"), data);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(DownloaderTest, ResumesGoodPiecesAndRepairsOnlyMissingData) {
+    const std::string first(kBlockSize, '1');
+    const std::string second(kBlockSize, '2');
+    const std::string data = first + second;
+    TorrentInfo torrent = makeSingleFileTorrent(data, "partial.bin");
+    torrent.pieces = utils::sha1(first) + utils::sha1(second);
+    auto dir = tempDir();
+    writeFile(dir / "partial.bin", first + std::string(kBlockSize, 'X'));
+
+    MockPeerServer server(torrent.infoHash, data);
+    ASSERT_TRUE(server.start());
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.addPeers({Peer{"127.0.0.1", server.port(), ""}});
+    downloader.start();
+
+    for (int i = 0; i < 300 && !downloader.isComplete(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    downloader.stop();
+    server.join();
+    EXPECT_TRUE(downloader.isComplete());
+    EXPECT_EQ(readFile(dir / "partial.bin"), data);
+    const auto requested = server.requestedPieces();
+    EXPECT_NE(std::find(requested.begin(), requested.end(), 1), requested.end());
+    EXPECT_EQ(std::find(requested.begin(), requested.end(), 0), requested.end());
+    std::filesystem::remove_all(dir);
+}
+
+TEST(DownloaderTest, ResumeRefusesToTruncateOversizedExistingFile) {
+    const std::string data(kBlockSize, 'L');
+    const std::string oversized = data + "do-not-truncate";
+    TorrentInfo torrent = makeSingleFileTorrent(data, "oversized.bin");
+    auto dir = tempDir();
+    writeFile(dir / "oversized.bin", oversized);
+
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.start();
+
+    EXPECT_FALSE(downloader.isRunning());
+    EXPECT_FALSE(downloader.isComplete());
+    EXPECT_EQ(readFile(dir / "oversized.bin"), oversized);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(DownloaderTest, OverwriteDiscardsOtherwiseValidExistingFile) {
+    const std::string data(kBlockSize, 'O');
+    TorrentInfo torrent = makeSingleFileTorrent(data, "overwrite.bin");
+    auto dir = tempDir();
+    writeFile(dir / "overwrite.bin", data);
+
+    MockPeerServer server(torrent.infoHash, data);
+    ASSERT_TRUE(server.start());
+    DownloadOptions opts;
+    opts.refreshTrackers = false;
+    opts.overwrite = true;
+    Downloader downloader(torrent, dir.string(), opts);
+    downloader.addPeers({Peer{"127.0.0.1", server.port(), ""}});
+    downloader.start();
+
+    for (int i = 0; i < 300 && !downloader.isComplete(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    downloader.stop();
+    server.join();
+    EXPECT_TRUE(downloader.isComplete());
+    EXPECT_EQ(readFile(dir / "overwrite.bin"), data);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(DownloaderTest, DownloadSinglePieceFromLocalPeer) {

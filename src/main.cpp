@@ -41,6 +41,7 @@ void printUsage(const char* program) {
     std::cout << "  -o, --download-dir <dir>   Directory to save downloaded files" << std::endl;
     std::cout << "      --max-peers <n>        Maximum concurrent peer connections (default: 30)" << std::endl;
     std::cout << "      --no-tracker-refresh   Do not fetch tracker lists from the internet" << std::endl;
+    std::cout << "      --overwrite            Discard existing output instead of resuming" << std::endl;
     std::cout << "  -v, --verbose              Verbose logging (tracker/peer details)" << std::endl;
     std::cout << "  -h, --help                 Show this help" << std::endl;
     std::cout << std::endl;
@@ -55,6 +56,7 @@ struct CliOptions {
     int maxPeers = 30;
     bool refreshTrackers = true;
     bool verbose = false;
+    bool overwrite = false;
 };
 
 // Parse CLI arguments, supporting both legacy positional args and new options.
@@ -91,6 +93,8 @@ bool parseArgs(int argc, char* argv[], CliOptions& opts) {
             }
         } else if (arg == "--no-tracker-refresh") {
             opts.refreshTrackers = false;
+        } else if (arg == "--overwrite") {
+            opts.overwrite = true;
         } else if (arg == "-v" || arg == "--verbose") {
             opts.verbose = true;
         } else if (!arg.empty() && arg[0] == '-') {
@@ -314,6 +318,7 @@ int main(int argc, char* argv[]) {
         options.maxPeers = opts.maxPeers;
         options.refreshTrackers = opts.refreshTrackers;
         options.verbose = opts.verbose;
+        options.overwrite = opts.overwrite;
 
         // Create downloader
         Downloader downloader(torrent, savePath, options);

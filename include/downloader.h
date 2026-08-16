@@ -21,6 +21,7 @@ struct DownloadOptions {
     int maxRequestsPerPeer = 5;     // pipelined block requests per peer
     bool refreshTrackers = true;    // fetch fresh tracker lists from the internet
     bool verbose = false;
+    bool overwrite = false;         // discard existing output instead of resuming
 };
 
 struct DownloadStats {
@@ -118,8 +119,9 @@ private:
         FILE* handle = nullptr;
     };
     bool openOutputFiles();
+    void restoreCompletedPieces();
     void closeOutputFiles();
-    static bool preallocateFile(FILE* f, int64_t size);
+    static bool resizeFile(FILE* f, int64_t size);
 
     TorrentInfo torrent_;
     std::string savePath_;

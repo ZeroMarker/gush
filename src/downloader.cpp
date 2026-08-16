@@ -15,6 +15,26 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <cerrno>
+
+namespace {
+bool safeResumeTarget(const std::string& path, int64_t expectedSize) {
+    struct stat info {};
+    if (stat(path.c_str(), &info) != 0) {
+        return errno == ENOENT;
+    }
+    return S_ISREG(info.st_mode) && info.st_size <= expectedSize;
+}
+
+FILE* openOutputHandle(const std::string& path, bool overwrite) {
+    if (overwrite) return fopen(path.c_str(), "w+b");
+    FILE* handle = fopen(path.c_str(), "r+b");
+    if (handle || errno != ENOENT) return handle;
+    return fopen(path.c_str(), "w+b");
+}
+}
 
 Downloader::Downloader(const TorrentInfo& torrent, const std::string& savePath,
                        const DownloadOptions& options)
@@ -55,15 +75,24 @@ void Downloader::start() {
         return;
     }
 
+    restoreCompletedPieces();
+    if (stopRequested_) {
+        running_ = false;
+        return;
+    }
+    if (isComplete()) {
+        utils::logInfo("Existing files already contain the complete download");
+        running_ = false;
+        return;
+    }
+
     // Start download loop in separate thread
     downloadThread_ = std::thread(&Downloader::downloadLoop, this);
 }
 
-bool Downloader::preallocateFile(FILE* f, int64_t size) {
-    if (size <= 0) return true;
-    return fseeko(f, size - 1, SEEK_SET) == 0 &&
-           fputc(0, f) != EOF &&
-           fflush(f) == 0 &&
+bool Downloader::resizeFile(FILE* f, int64_t size) {
+    if (!f || size < 0) return false;
+    return fflush(f) == 0 && ftruncate(fileno(f), size) == 0 &&
            fseeko(f, 0, SEEK_SET) == 0;
 }
 
@@ -83,12 +112,13 @@ bool Downloader::openOutputFiles() {
         f.path = outputPath;
         f.startOffset = 0;
         f.length = total;
-        // "w+b": read/write mode. verifyPiece() re-reads each piece from this
-        // same FILE* to check its SHA1, so a write-only "wb" handle would make
-        // every verification fail (fread on a write-only stream is UB).
-        f.handle = fopen(outputPath.c_str(), "w+b");
+        if (!options_.overwrite && !safeResumeTarget(f.path, f.length)) {
+            utils::logError("Existing output is larger than expected; use --overwrite: " + f.path);
+            return false;
+        }
+        f.handle = openOutputHandle(outputPath, options_.overwrite);
         if (!f.handle) return false;
-        if (!preallocateFile(f.handle, f.length)) {
+        if (!resizeFile(f.handle, f.length)) {
             fclose(f.handle);
             return false;
         }
@@ -96,7 +126,8 @@ bool Downloader::openOutputFiles() {
         return true;
     }
 
-    // Multi-file mode: create directories and one file per FileEntry
+    // Multi-file mode: resolve and preflight every target before changing any
+    // existing file, then open all handles before resizing them.
     int64_t runningOffset = 0;
     for (const auto& fileEntry : torrent_.files) {
         const std::string relPath = utils::sanitizePath(fileEntry.path);
@@ -112,17 +143,51 @@ bool Downloader::openOutputFiles() {
         f.path = outputPath;
         f.startOffset = runningOffset;
         f.length = fileEntry.length;
-        // "w+b": read/write mode so verifyPiece() can re-read the piece.
-        f.handle = fopen(outputPath.c_str(), "w+b");
-        if (!f.handle) return false;
-        if (!preallocateFile(f.handle, f.length)) {
-            fclose(f.handle);
+        if (!options_.overwrite && !safeResumeTarget(f.path, f.length)) {
+            utils::logError("Existing output is larger than expected; use --overwrite: " + f.path);
             return false;
         }
         outputFiles_.push_back(f);
         runningOffset += fileEntry.length;
     }
+
+    for (auto& f : outputFiles_) {
+        f.handle = openOutputHandle(f.path, options_.overwrite);
+        if (!f.handle) {
+            closeOutputFiles();
+            return false;
+        }
+    }
+    for (auto& f : outputFiles_) {
+        if (!resizeFile(f.handle, f.length)) {
+            closeOutputFiles();
+            return false;
+        }
+    }
     return true;
+}
+
+void Downloader::restoreCompletedPieces() {
+    piecesCompletedCount_ = 0;
+    downloadedBytes_ = 0;
+    for (std::size_t i = 0; i < torrent_.numPieces(); ++i) {
+        if (stopRequested_) break;
+        const bool valid = verifyPiece(static_cast<uint32_t>(i));
+        piecesCompleted_[i] = valid;
+        PieceState& state = pieceStates_[i];
+        state.blocksRequested.assign(state.totalBlocks, false);
+        state.blocksReceived.assign(state.totalBlocks, valid);
+        state.receivedBlocks = valid ? state.totalBlocks : 0;
+        if (valid) {
+            ++piecesCompletedCount_;
+            downloadedBytes_ += pieceSize(static_cast<uint32_t>(i));
+        }
+    }
+    lastDownloadedBytes_ = downloadedBytes_;
+    if (downloadedBytes_ > 0) {
+        utils::logInfo("Resumed " + std::to_string(piecesCompletedCount_) + "/" +
+                       std::to_string(torrent_.numPieces()) + " verified pieces");
+    }
 }
 
 void Downloader::closeOutputFiles() {
@@ -167,9 +232,19 @@ void Downloader::downloadLoop() {
     const int TRACKER_FETCH_INTERVAL = 300;  // Fetch new trackers every 5 minutes
     const int PRUNE_INTERVAL = 10;           // Peer health check every 10 seconds
 
+    if (stopRequested_) {
+        running_ = false;
+        return;
+    }
+
     // Fetch latest trackers from online sources
     if (options_.refreshTrackers) {
         fetchLatestTrackers();
+    }
+
+    if (stopRequested_) {
+        running_ = false;
+        return;
     }
 
     // Contact tracker initially
@@ -177,6 +252,11 @@ void Downloader::downloadLoop() {
     TrackerResponse trackerResp = trackerManager_.contact(
         torrent_, peerId_, downloadedBytes_, uploadedBytes_,
         torrent_.totalLength() - downloadedBytes_, "started", 3);
+
+    if (stopRequested_) {
+        running_ = false;
+        return;
+    }
 
     if (trackerResp.ok()) {
         utils::logInfo("Tracker response: " + std::to_string(trackerResp.peers.size()) +
@@ -200,6 +280,10 @@ void Downloader::downloadLoop() {
         dhtOptions.maxQueries = 16;
         dhtOptions.maxPeers = static_cast<std::size_t>(options_.maxPeers) * 2;
         auto dhtPeers = discoverDhtPeers(torrent_.infoHash, {}, dhtOptions);
+        if (stopRequested_) {
+            running_ = false;
+            return;
+        }
         if (!dhtPeers.empty()) {
             utils::logInfo("DHT discovered " + std::to_string(dhtPeers.size()) + " peers");
             addPeers(dhtPeers);

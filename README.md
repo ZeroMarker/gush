@@ -19,6 +19,7 @@ A minimal BitTorrent client implemented in modern C++17.
 - **Peer health management**: slow/failing peers are evicted and temporarily blacklisted
 - Single- and multi-file downloads with path-traversal-safe filenames
 - Byte-accurate progress display with live speed
+- Piece-verified resume for existing single- and multi-file downloads
 
 ## Dependencies
 
@@ -47,6 +48,7 @@ gush [options] <torrent_file|magnet_link> [output_directory]
 | `-o, --download-dir <dir>` | Directory to save downloaded files (default: current directory) |
 | `--max-peers <n>` | Maximum concurrent peer connections (default: 30, range 1-500) |
 | `--no-tracker-refresh` | Do not fetch tracker lists from the internet |
+| `--overwrite` | Discard existing output instead of verifying and resuming it |
 | `-v, --verbose` | Verbose logging (tracker/peer details) |
 | `-h, --help` | Show help |
 
@@ -62,7 +64,25 @@ gush [options] <torrent_file|magnet_link> [output_directory]
 # With options
 ./gush -o ~/Downloads --max-peers 50 "magnet:?xt=urn:btih:HASH"
 ./gush --no-tracker-refresh ubuntu-22.04.torrent
+
+# Discard an existing partial download and start over
+./gush --overwrite -o ~/Downloads ubuntu-22.04.torrent
 ```
+
+### Resume and overwrite behavior
+
+Resume is enabled by default. Before contacting trackers or peers, gush opens
+existing output files without truncating them and verifies every piece against
+the SHA1 hashes in the torrent metadata. Verified pieces count toward progress
+and are not requested again; missing or corrupt pieces are downloaded normally.
+This works when a piece crosses file boundaries in a multi-file torrent.
+
+Output files are resized to the lengths declared by the torrent before
+verification. Startup can therefore take noticeable time for large existing
+downloads because all stored data must be read and hashed. Use `--overwrite` to
+truncate the output and start from zero instead. To protect unrelated data,
+resume mode refuses to truncate an existing file that is larger than the
+torrent declares; use `--overwrite` explicitly if that replacement is intended.
 
 ### Magnet Link Support
 
@@ -93,9 +113,12 @@ gush/
     ├── torrent.cpp
     ├── tracker.cpp
     ├── tracker_manager.cpp
+    ├── dht.cpp
     ├── peer.cpp
     ├── downloader.cpp
     ├── metadata.cpp
+    ├── magnet.cpp
+    ├── tracker_list.cpp
     └── utils.cpp
 ```
 
@@ -107,12 +130,14 @@ ctest --output-on-failure
 ```
 
 Unit tests cover bencode, magnet links, torrent parsing, tracker and DHT responses,
-peer protocols, downloader integration and utilities. A CI workflow (`.github/workflows/ci.yml`)
-runs the suite under Release and ASan/UBSan builds.
+peer protocols, downloader integration, verified resume, overwrite behavior and
+utilities. A CI workflow (`.github/workflows/ci.yml`) runs the suite under Release
+and ASan/UBSan builds.
 
 ## Limitations (MVP)
 
 - DHT currently supports IPv4 peer discovery only (no BEP 5 announce/listener mode)
+- Resume verifies the complete existing payload at startup; no fast-resume sidecar is stored
 - No encryption support
 
 ## License
